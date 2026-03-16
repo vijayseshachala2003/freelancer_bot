@@ -1,0 +1,41 @@
+# Secrets and credentials – never commit
+.env
+.env.*
+!.env.example
+service_account.json
+*.pem
+secrets/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Runtime / local output
+bot_output.txt
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / editor (optional – uncomment if you want to ignore)
+# .cursor/
+# .vscode/
+# .idea/
+# *.swp
+# *.swo
