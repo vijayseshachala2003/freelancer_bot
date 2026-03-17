@@ -1,0 +1,6 @@
+
+gspread
+google-auth
+python-dotenv
+aiohttp
+discord
