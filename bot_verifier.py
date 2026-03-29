@@ -127,6 +127,7 @@ VERIFY_PANEL_BODY = (
 MANAGED_ACCESS_ROLE_NAMES: Tuple[str, ...] = (
     "BB_Access",
     "BB-Access",
+    "AE-Access",
 )
 
 
