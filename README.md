@@ -8,7 +8,11 @@ A single-process Discord bot that enforces **verify-before-access** for a config
 - **Modal verification:** A persistent **Verify now** button opens a modal for the user’s **Deccan-associated email**; the bot matches it to the `allocations` table (and optional `discord_email`).
 - **Role sync from DB:** On success and on resync, Discord roles are aligned with `allocations.projects` tokens. Any managed access role the member has that is **not** in their current allocation is **removed** (manual invites or stale roles).
 - **Channel `#verify-yourself`:** Name is fixed in code (`VERIFY_CHANNEL_NAME`). The bot posts a verify panel once if missing; verification notices and several commands attach the same **Verify now** button where possible.
+<<<<<<< HEAD
 - **Compliance:** A **full guild audit** runs on startup (if enabled) and **every minute**—every member is checked against the database. A scoped admin command **`!audit_bluebird`** only processes members who currently hold at least one managed access role.
+=======
+- **Compliance:** A **full guild audit** runs on startup (if enabled) and **every 30 minutes**—every member is checked against the database. A scoped admin command **`!audit_bluebird`** only processes members who currently hold at least one managed access role.
+>>>>>>> c1561dd (updated read me file)
 - **Revoke pipeline:** Rows with `access_revoked = true` are polled and applied in Discord; admin **`!revoke_access`** clears access and re-notifies the member.
 - **HTTP health server:** Listens on `PORT` (default `8080`) for `GET /healthz` and `GET /readyz` (useful on Render and similar hosts).
 
@@ -30,7 +34,11 @@ pip install -r requirements.txt
 
 ## Configuration
 
+<<<<<<< HEAD
 Create a `.env` in the project root (loaded by `python-dotenv`). Required and common variables:
+=======
+Copy `env.example` to `.env` in the project root (loaded by `python-dotenv`). Required and common variables:
+>>>>>>> c1561dd (updated read me file)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -95,11 +103,19 @@ Prefix is **`!`**. Built-in `help` is disabled (`help_command=None`); use **`!he
 
 ## Background behavior
 
+<<<<<<< HEAD
 - **`verification_compliance_loop`:** Every **1 minute**, full guild compliance pass (quiet status channel by default).
 - **`timeout_cleanup_loop`:** Every **1 minute**, users past `VERIFICATION_TIMEOUT_HOURS` in a stale unverified state are gated and timed out in DB; status channel message on timeout if configured.
 - **`revoke_poll_loop`:** Every **1 minute**, applies pending `access_revoked` flags.
 
 Verification **pings** with the **Verify now** button are sent on join (normal path), when compliance **strips** managed roles from someone not verified, on scoped audit in the same situation, and when admins reset or revoke access—not on every minute for every pending user with no access roles.
+=======
+- **`verification_compliance_loop`:** Every **30 minutes**, full guild compliance pass (quiet status channel by default).
+- **`timeout_cleanup_loop`:** Every **1 minute**, users past `VERIFICATION_TIMEOUT_HOURS` in a stale unverified state are gated and timed out in DB; status channel message on timeout if configured.
+- **`revoke_poll_loop`:** Every **1 minute**, applies pending `access_revoked` flags.
+
+Verification **pings** with the **Verify now** button are sent on join (normal path), when compliance **strips** managed roles from someone not verified, on scoped audit in the same situation, and when admins reset or revoke access—not on every scheduled pass for every pending user with no access roles.
+>>>>>>> c1561dd (updated read me file)
 
 ## HTTP endpoints
 

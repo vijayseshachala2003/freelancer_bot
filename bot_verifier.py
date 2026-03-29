@@ -680,7 +680,7 @@ intents.message_content = True  # Enable "Message Content Intent" for !commands 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 db = Database(SETTINGS.database_url)
 
-# Only one full guild compliance audit at a time (startup + 1m loop + manual must not overlap).
+# Only one full guild compliance audit at a time (startup + 30m loop + manual must not overlap).
 _compliance_audit_lock = asyncio.Lock()
 
 
@@ -1353,9 +1353,9 @@ async def before_timeout_cleanup_loop() -> None:
     await bot.wait_until_ready()
 
 
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=30)
 async def verification_compliance_loop() -> None:
-    """Re-run full verify-first compliance pass every minute (temporary high cadence)."""
+    """Re-run full verify-first compliance pass every 30 minutes."""
     guild = bot.get_guild(SETTINGS.guild_id)
     if not guild:
         return
