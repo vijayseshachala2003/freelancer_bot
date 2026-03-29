@@ -5,14 +5,12 @@ A single-process Discord bot that enforces **verify-before-access** for a config
 ## Features
 
 - **Verify-first gating:** Users get the configured **Unverified** role until they complete verification. Managed access roles (see `MANAGED_ACCESS_ROLE_NAMES` in code) are removed on join, failed checks, revoke, and timeout until the user is verified.
+- **Staff exempt roles:** Members with any role in **`VERIFICATION_EXEMPT_ROLE_NAMES`** (in `bot_verifier.py`, e.g. Admin, Support, managers) are treated as **automatically exempt**: marked in the DB as `verification_status=exempt`, never gated or stripped by compliance, and **not** resynced from `allocations` (their Discord roles stay as you set them). They do not need the Verify modal.
 - **Modal verification:** A persistent **Verify now** button opens a modal for the user’s **Deccan-associated email**; the bot matches it to the `allocations` table (and optional `discord_email`).
 - **Role sync from DB:** On success and on resync, Discord roles are aligned with `allocations.projects` tokens. Any managed access role the member has that is **not** in their current allocation is **removed** (manual invites or stale roles).
-- **Channel `#verify-yourself`:** Name is fixed in code (`VERIFY_CHANNEL_NAME`). The bot posts a verify panel once if missing; verification notices and several commands attach the same **Verify now** button where possible.
-<<<<<<< HEAD
-- **Compliance:** A **full guild audit** runs on startup (if enabled) and **every minute**—every member is checked against the database. A scoped admin command **`!audit_bluebird`** only processes members who currently hold at least one managed access role.
-=======
+- **Channel `#verify-yourself`:** Name is fixed in code (`VERIFY_CHANNEL_NAME`). On startup the bot can set **channel permissions** so **@everyone** cannot view the channel and only **Unverified** + the **bot** can (see `VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED`). That way verify notices and the panel are visible mainly to people who still need to verify. The bot posts a verify panel once if missing; notices and several commands attach **Verify now** where possible.
+- **Auto-link from `allocations.discord_email`:** If exactly one active allocation row has `discord_email` set to the member’s Discord **username** or **global display name** (normalized), the bot can verify them automatically on join or at the next compliance pass and apply roles from that row’s **`projects`** (canonical key remains **`allocations.email`**).
 - **Compliance:** A **full guild audit** runs on startup (if enabled) and **every 30 minutes**—every member is checked against the database. A scoped admin command **`!audit_bluebird`** only processes members who currently hold at least one managed access role.
->>>>>>> c1561dd (updated read me file)
 - **Revoke pipeline:** Rows with `access_revoked = true` are polled and applied in Discord; admin **`!revoke_access`** clears access and re-notifies the member.
 - **HTTP health server:** Listens on `PORT` (default `8080`) for `GET /healthz` and `GET /readyz` (useful on Render and similar hosts).
 
@@ -34,11 +32,7 @@ pip install -r requirements.txt
 
 ## Configuration
 
-<<<<<<< HEAD
-Create a `.env` in the project root (loaded by `python-dotenv`). Required and common variables:
-=======
 Copy `env.example` to `.env` in the project root (loaded by `python-dotenv`). Required and common variables:
->>>>>>> c1561dd (updated read me file)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -54,12 +48,15 @@ Copy `env.example` to `.env` in the project root (loaded by `python-dotenv`). Re
 | `STATUS_CHANNEL_NAME` | No | If set, bot posts operational summaries (audits, timeouts, revokes) there. |
 | `PORT` | No | HTTP server port; default `8080`. |
 | `LOG_LEVEL` | No | Default `INFO`. |
+| `VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED` | No | Default `true`: on connect, bot sets `#verify-yourself` so **@everyone** has **View Channel** denied and **Unverified** + bot allowed. Set `false` to leave channel permissions manual. Bot needs **Manage Channels**. |
 
 \*Either `DATABASE_URL` or `SUPABASE_DB_HOST` + `SUPABASE_DB_PASSWORD` must be set.
 
 ### Managed access roles (not in `.env`)
 
 Edit the tuple **`MANAGED_ACCESS_ROLE_NAMES`** near the top of `bot_verifier.py`. Each entry must be the **exact** Discord role name. The tuple must be non-empty at startup. Every token in `allocations.projects` must be listed here, or the bot will not assign that role.
+
+Edit **`VERIFICATION_EXEMPT_ROLE_NAMES`** in the same file for staff who skip verification (exact role names).
 
 ## Database
 
@@ -69,6 +66,8 @@ On connect, the bot runs `init_schema()` and ensures tables exist (and applies l
 - **`discord_user_verification`** — One row per Discord user ID; verification state, `assigned_projects` / `assigned_roles` JSON, `access_revoked`, `status` (VERIFIED / NOT_VERIFIED), etc.
 
 The `projects` column uses separators **`,` `;` `/` `|`** between tokens. Each token is a Discord role name that must appear in `MANAGED_ACCESS_ROLE_NAMES`.
+
+Optional **`discord_email`** on an allocation: use the member’s Discord username (or global name) to allow **automatic** verification and role sync from **`projects`** without storing a Discord user id on `allocations`.
 
 ## Running the bot
 
@@ -84,7 +83,7 @@ The process starts the aiohttp health server, connects to Postgres, registers pe
 
 - Create roles: **Unverified**, managed access roles (e.g. `BB_Access`), and **Admin** (or your configured names).
 - Create text channel **`verify-yourself`** (exact name unless you change `VERIFY_CHANNEL_NAME` in code).
-- **Bot role** must be **above** managed access roles in the hierarchy and needs **Manage Roles** (and permissions to post in verify and status channels).
+- **Bot role** must be **above** managed access roles in the hierarchy and needs **Manage Roles** (and permissions to post in verify and status channels). For automatic verify-channel privacy, the bot also needs **Manage Channels** (or set `VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED=false` and configure `#verify-yourself` manually: deny **View Channel** for @everyone, allow **Unverified** and the bot).
 - Gate content channels/categories: deny **Unverified** view where appropriate; allow managed access roles. Allow **Unverified** on `#verify-yourself`.
 - Prefer invites that do **not** auto-grant managed access roles; the bot strips them for unverified users anyway.
 
@@ -103,19 +102,11 @@ Prefix is **`!`**. Built-in `help` is disabled (`help_command=None`); use **`!he
 
 ## Background behavior
 
-<<<<<<< HEAD
-- **`verification_compliance_loop`:** Every **1 minute**, full guild compliance pass (quiet status channel by default).
-- **`timeout_cleanup_loop`:** Every **1 minute**, users past `VERIFICATION_TIMEOUT_HOURS` in a stale unverified state are gated and timed out in DB; status channel message on timeout if configured.
-- **`revoke_poll_loop`:** Every **1 minute**, applies pending `access_revoked` flags.
-
-Verification **pings** with the **Verify now** button are sent on join (normal path), when compliance **strips** managed roles from someone not verified, on scoped audit in the same situation, and when admins reset or revoke access—not on every minute for every pending user with no access roles.
-=======
 - **`verification_compliance_loop`:** Every **30 minutes**, full guild compliance pass (quiet status channel by default).
 - **`timeout_cleanup_loop`:** Every **1 minute**, users past `VERIFICATION_TIMEOUT_HOURS` in a stale unverified state are gated and timed out in DB; status channel message on timeout if configured.
 - **`revoke_poll_loop`:** Every **1 minute**, applies pending `access_revoked` flags.
 
 Verification **pings** with the **Verify now** button are sent on join (normal path), when compliance **strips** managed roles from someone not verified, on scoped audit in the same situation, and when admins reset or revoke access—not on every scheduled pass for every pending user with no access roles.
->>>>>>> c1561dd (updated read me file)
 
 ## HTTP endpoints
 

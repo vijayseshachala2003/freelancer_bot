@@ -27,6 +27,8 @@ load_dotenv()
 # - Verified users: resync managed access roles from `allocations` (by canonical `email` PK), else from DB assigned_roles snapshot
 # - Hard revoke (!revoke_access / access_revoked): gate + strip managed access roles
 # - Admins: !kick / !ban — allocations.status REVOKE/BAN (by stored allocation email); !audit_bluebird — members with any managed access role
+# - VERIFICATION_EXEMPT_ROLE_NAMES (code): staff skip verify; marked DB exempt; no allocation resync / strip; Verify UI tells them they are exempt
+# - On ready: optional channel overwrites on #verify-yourself — deny @everyone view, allow Unverified + bot (VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED)
 # - Timeout: strip managed access roles + gate; verification state in PostgreSQL / Supabase
 # - #verify-yourself: bot ensures a **Verify now** panel message exists (posted once if missing)
 #
@@ -64,6 +66,8 @@ load_dotenv()
 # AUDIT_ON_STARTUP=true
 # When true, full compliance audit on boot (all members). Use !audit_bluebird for a scoped sweep.
 # Managed access Discord roles: edit MANAGED_ACCESS_ROLE_NAMES in this file (tuple below — not .env).
+# Verification-exempt staff roles: VERIFICATION_EXEMPT_ROLE_NAMES in this file.
+# VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED=true (default): bot sets #verify-yourself visible only to Unverified + bot.
 #
 # Optional:
 # LOG_LEVEL=INFO
@@ -109,6 +113,12 @@ VERIFY_PANEL_BODY = (
 #    Each token must be the EXACT Discord role name as it appears in Server Settings → Roles, and each
 #    name must appear in MANAGED_ACCESS_ROLE_NAMES below. The bot does not build names from a suffix pattern.
 #
+#    Optional `discord_email` on `allocations`: set this to the member's Discord username (`member.name`) or
+#    their global display name (`member.global_name`) — normalized, case/spacing-insensitive. When exactly one
+#    allocation row matches on join (or compliance), the bot auto-completes verification and assigns roles from
+#    that row's `projects` using the row's primary `email` as the canonical allocation key (no Discord user id
+#    stored on `allocations`).
+#
 # 3) On successful verification, the bot matches the user's email to exactly one allocation row, reads
 #    `projects`, and syncs Discord: add each listed managed role (if it exists on the server) and **remove**
 #    any other MANAGED_ACCESS_ROLE_NAMES the member still has (e.g. from a manual invite or old allocation).
@@ -130,6 +140,16 @@ MANAGED_ACCESS_ROLE_NAMES: Tuple[str, ...] = (
     "AE-Access",
 )
 
+# Staff / ops roles: no verification flow; marked exempt in DB; not gated or stripped by compliance.
+# Case-sensitive — must match Server Settings → Roles exactly.
+VERIFICATION_EXEMPT_ROLE_NAMES: Tuple[str, ...] = (
+    "Admin",
+    "Support",
+    "AE-Manager",
+    "BB-Manager",
+    "MAITRIX-moderator",
+)
+
 
 # ============================================================
 # Config
@@ -146,6 +166,8 @@ class Settings:
     audit_on_startup: bool = True
     status_channel_name: Optional[str] = None
     managed_access_role_names: frozenset[str] = field(default_factory=frozenset)
+    verification_exempt_role_names: frozenset[str] = field(default_factory=frozenset)
+    restrict_verify_channel_to_unverified: bool = True
 
 
 def resolve_database_url() -> str:
@@ -210,6 +232,11 @@ def get_settings() -> Settings:
         audit_on_startup=os.getenv("AUDIT_ON_STARTUP", "true").lower() == "true",
         status_channel_name=os.getenv("STATUS_CHANNEL_NAME"),
         managed_access_role_names=managed,
+        verification_exempt_role_names=frozenset(VERIFICATION_EXEMPT_ROLE_NAMES),
+        restrict_verify_channel_to_unverified=os.getenv(
+            "VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED", "true"
+        ).lower()
+        in ("1", "true", "yes"),
     )
 
     if missing:
@@ -482,6 +509,64 @@ class Database:
                 json.dumps(source_row, default=str),
             )
 
+    async def mark_verification_exempt(self, guild_id: int, member: discord.Member) -> None:
+        """Staff/ops: no allocation; DB marked VERIFIED with verification_status=exempt (compliance skips stripping)."""
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO discord_user_verification (
+                    discord_user_id, guild_id, discord_username, last_seen_at,
+                    is_verified, verification_status, verified_at, verification_locked,
+                    status, access_revoked, removed_for_timeout,
+                    assigned_projects, assigned_roles, last_error
+                ) VALUES (
+                    $1, $2, $3, NOW(),
+                    TRUE, 'exempt', NOW(), TRUE,
+                    'VERIFIED', FALSE, FALSE,
+                    '[]'::jsonb, '[]'::jsonb, NULL
+                )
+                ON CONFLICT (discord_user_id)
+                DO UPDATE SET
+                    guild_id = EXCLUDED.guild_id,
+                    discord_username = EXCLUDED.discord_username,
+                    last_seen_at = NOW(),
+                    is_verified = TRUE,
+                    verification_status = 'exempt',
+                    verified_at = COALESCE(discord_user_verification.verified_at, NOW()),
+                    verification_locked = TRUE,
+                    status = 'VERIFIED',
+                    access_revoked = FALSE,
+                    removed_for_timeout = FALSE,
+                    assigned_projects = '[]'::jsonb,
+                    assigned_roles = '[]'::jsonb,
+                    source_row = NULL,
+                    email = NULL,
+                    last_error = NULL;
+                """,
+                str(member.id),
+                str(guild_id),
+                str(member),
+            )
+
+    async def clear_verification_exempt_record_state(self, discord_user_id: int) -> None:
+        """If DB says exempt but member no longer has exempt role, reset to pending / NOT_VERIFIED."""
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE discord_user_verification SET
+                    verification_status = 'pending',
+                    status = 'NOT_VERIFIED',
+                    is_verified = FALSE,
+                    verification_locked = FALSE,
+                    verified_at = NULL,
+                    last_seen_at = NOW()
+                WHERE discord_user_id = $1 AND verification_status = 'exempt';
+                """,
+                str(discord_user_id),
+            )
+
     async def mark_timeout_removed(self, discord_user_id: int, reason: str) -> None:
         assert self.pool is not None
         async with self.pool.acquire() as conn:
@@ -669,6 +754,27 @@ class Database:
             return False, row, "This allocation is revoked or banned."
         return True, row, "matched"
 
+    async def fetch_allocations_matching_discord_link_handle(self, handle: str) -> List[Dict[str, Any]]:
+        """Allocations whose `discord_email` field matches this handle (norm_str equality)."""
+        nh = norm_str(handle)
+        if not nh:
+            return []
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT email, discord_email, full_name, projects, active, status
+                FROM allocations
+                WHERE discord_email IS NOT NULL AND BTRIM(discord_email) != ''
+                """
+            )
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            if norm_str(d.get("discord_email")) == nh:
+                out.append(d)
+        return out
+
 
 # ============================================================
 # Discord bot
@@ -692,6 +798,8 @@ def member_db_verified(record: Optional[Any]) -> bool:
     """True if the user is verified per DB `status` (or legacy is_verified + verification_locked)."""
     if not record:
         return False
+    if str(record.get("verification_status") or "").strip().lower() == "exempt":
+        return True
     st = record.get("status")
     if isinstance(st, str):
         st = st.strip().upper()
@@ -702,12 +810,39 @@ def member_db_verified(record: Optional[Any]) -> bool:
     return bool(record.get("is_verified") and record.get("verification_locked"))
 
 
+def verification_source_row_dict(record: Any) -> Optional[Dict[str, Any]]:
+    """Parse `source_row` JSONB from a verification record into a dict."""
+    if not record:
+        return None
+    sr = record.get("source_row")
+    if sr is None:
+        return None
+    if isinstance(sr, dict):
+        return sr
+    if isinstance(sr, str):
+        try:
+            return json.loads(sr)
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
 def get_role(guild: discord.Guild, role_name: str) -> Optional[discord.Role]:
     return discord.utils.get(guild.roles, name=role_name)
 
 
 def get_channel_by_name(guild: discord.Guild, channel_name: str) -> Optional[discord.abc.GuildChannel]:
     return discord.utils.get(guild.channels, name=channel_name)
+
+
+def member_is_verification_exempt(member: discord.Member) -> bool:
+    """True if the member has any role listed in VERIFICATION_EXEMPT_ROLE_NAMES / settings."""
+    if member.bot:
+        return False
+    for role in member.roles:
+        if role.name in SETTINGS.verification_exempt_role_names:
+            return True
+    return False
 
 
 def is_access_role_name(name: str) -> bool:
@@ -853,11 +988,29 @@ async def resync_verified_member_roles(member: discord.Member, record: Any, reas
     """
     Clear verification gate roles, then restore managed access roles from current `allocations` row (by stored `email` PK),
     or from `assigned_roles` JSON snapshot if allocation is missing or not verifiable.
+    Exempt staff (by role or DB verification_status=exempt) never get allocation-driven role sync — only Unverified cleared.
     """
+    if member_is_verification_exempt(member):
+        await db.mark_verification_exempt(member.guild.id, member)
+        await remove_role_if_present(member, SETTINGS.unverified_role_name, reason)
+        await remove_role_if_present(member, SETTINGS.verified_role_name, f"{reason} (legacy Verified role)")
+        return
+    if record and str(record.get("verification_status") or "").strip().lower() == "exempt":
+        if member_is_verification_exempt(member):
+            await remove_role_if_present(member, SETTINGS.unverified_role_name, reason)
+            await remove_role_if_present(member, SETTINGS.verified_role_name, f"{reason} (legacy Verified role)")
+            return
+        await db.clear_verification_exempt_record_state(member.id)
+        record = await db.get_user(member.id)
+
     await remove_role_if_present(member, SETTINGS.unverified_role_name, reason)
     await remove_role_if_present(member, SETTINGS.verified_role_name, f"{reason} (legacy Verified role)")
 
     alloc_email = (record.get("email") or "").strip() if record else ""
+    if not alloc_email:
+        srd = verification_source_row_dict(record)
+        if srd:
+            alloc_email = str(srd.get("email") or "").strip()
     alloc: Optional[Dict[str, Any]] = None
     if alloc_email:
         alloc = await db.fetch_allocation_by_email(alloc_email)
@@ -875,6 +1028,62 @@ async def resync_verified_member_roles(member: discord.Member, record: Any, reas
         if s in SETTINGS.managed_access_role_names
     )
     await sync_managed_access_roles(member, allowed, f"{reason} (DB snapshot)")
+
+
+async def try_auto_verify_from_allocation_discord_link(member: discord.Member) -> bool:
+    """
+    If exactly one verifiable allocation row has `discord_email` matching this member's Discord username
+    or global display name (normalized), complete verification and apply `projects` from that row.
+    Canonical allocation key remains `allocations.email` (PK), not Discord user id.
+    """
+    if member.bot:
+        return False
+    if member_is_verification_exempt(member):
+        return False
+
+    candidates: Dict[str, Dict[str, Any]] = {}
+    handles: List[str] = [member.name]
+    gn = getattr(member, "global_name", None)
+    if gn and str(gn).strip():
+        handles.append(str(gn).strip())
+
+    for h in handles:
+        for row in await db.fetch_allocations_matching_discord_link_handle(h):
+            em = str(row.get("email") or "").strip()
+            if em:
+                candidates[em] = row
+
+    if len(candidates) != 1:
+        if len(candidates) > 1:
+            logger.warning(
+                "Auto-verify skipped for member %s: multiple allocations match discord_email / display (%s rows)",
+                member.id,
+                len(candidates),
+            )
+        return False
+
+    row = next(iter(candidates.values()))
+    if not allocation_row_can_verify(row):
+        logger.info(
+            "Auto-verify skipped for member %s: allocation %s not verifiable",
+            member.id,
+            row.get("email"),
+        )
+        return False
+
+    typed = str(row.get("email") or "").strip()
+    try:
+        await finalize_verified_member(member, row, typed_email=typed)
+    except Exception:
+        logger.exception("Auto-verify finalize failed for member %s", member.id)
+        return False
+
+    logger.info(
+        "Auto-verified member %s from allocations.discord_email → allocation email=%s",
+        member.id,
+        typed,
+    )
+    return True
 
 
 def member_access_role_names(member: discord.Member) -> List[str]:
@@ -939,6 +1148,8 @@ async def send_verification_required_notice(member: discord.Member) -> None:
     Ensure the verify channel (or system channel) allows the Unverified role to *View Channel*
     if members must read the notice there.
     """
+    if member_is_verification_exempt(member):
+        return
     guild = member.guild
     verify_ch = get_channel_by_name(guild, VERIFY_CHANNEL_NAME)
     if verify_ch and isinstance(verify_ch, discord.TextChannel):
@@ -1050,6 +1261,13 @@ class VerifyModal(discord.ui.Modal, title="Discord Access Verification"):
             )
             return
 
+        if member_is_verification_exempt(interaction.user):
+            await interaction.followup.send(
+                "Your role does not require verification.",
+                ephemeral=True,
+            )
+            return
+
         record = await db.get_user(interaction.user.id)
         if record and record.get("access_revoked"):
             await interaction.followup.send(
@@ -1116,6 +1334,13 @@ class VerifyView(discord.ui.View):
             await interaction.response.send_message("Guild context missing.", ephemeral=True)
             return
 
+        if member_is_verification_exempt(interaction.user):
+            await interaction.response.send_message(
+                "Your role does not require verification.",
+                ephemeral=True,
+            )
+            return
+
         # Open the modal immediately (no DB await first). Pre-checks run in VerifyModal.on_submit — avoids
         # 10062 when a long compliance audit delays this handler past Discord's 3s interaction window.
         try:
@@ -1154,6 +1379,64 @@ async def ensure_verify_panel_in_channel(guild: discord.Guild) -> None:
         logger.warning("Verify panel: could not post in #%s: %s", VERIFY_CHANNEL_NAME, exc)
 
 
+async def ensure_verify_channel_permissions(guild: discord.Guild) -> None:
+    """
+    Restrict #verify-yourself so @everyone cannot view; allow Unverified + bot only.
+    Staff without Unverified then cannot read verify pings/panel (configure VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED=false to skip).
+    Requires bot: Manage Channels; bot role should be above @everyone for overwrites to apply reliably.
+    """
+    if not SETTINGS.restrict_verify_channel_to_unverified:
+        return
+    ch = get_channel_by_name(guild, VERIFY_CHANNEL_NAME)
+    if not ch or not isinstance(ch, discord.TextChannel):
+        logger.warning("Verify channel permissions: #%s not found", VERIFY_CHANNEL_NAME)
+        return
+    me = guild.me
+    if not me:
+        return
+    unverified = get_role(guild, SETTINGS.unverified_role_name)
+    if not unverified:
+        logger.warning(
+            "Verify channel permissions: role %r missing — create it or disable auto-restrict",
+            SETTINGS.unverified_role_name,
+        )
+        return
+    try:
+        await ch.set_permissions(
+            guild.default_role,
+            view_channel=False,
+            reason="Verify-yourself: only Unverified + bot should see this channel",
+        )
+        await ch.set_permissions(
+            unverified,
+            view_channel=True,
+            read_message_history=True,
+            reason="Members who must verify can read this channel",
+        )
+        await ch.set_permissions(
+            me,
+            view_channel=True,
+            send_messages=True,
+            embed_links=True,
+            attach_files=True,
+            read_message_history=True,
+            manage_messages=True,
+            reason="Bot verify panel and notices",
+        )
+        logger.info(
+            "Set #%s: deny view @everyone; allow %s + bot",
+            VERIFY_CHANNEL_NAME,
+            SETTINGS.unverified_role_name,
+        )
+    except discord.Forbidden:
+        logger.warning(
+            "Could not set #%s permissions — bot needs Manage Channels (and sufficient role position)",
+            VERIFY_CHANNEL_NAME,
+        )
+    except discord.HTTPException as exc:
+        logger.warning("Verify channel permission update failed: %s", exc)
+
+
 # ============================================================
 # Events
 # ============================================================
@@ -1166,6 +1449,7 @@ async def on_ready() -> None:
         return
 
     await ensure_roles_exist(guild)
+    await ensure_verify_channel_permissions(guild)
     await ensure_verify_panel_in_channel(guild)
 
     if not timeout_cleanup_loop.is_running():
@@ -1206,9 +1490,18 @@ async def on_member_join(member: discord.Member) -> None:
         logger.info("Member %s has access_revoked flag; kept in gate", member)
         return
 
+    if member_is_verification_exempt(member):
+        await resync_verified_member_roles(member, record, "New member: verification exempt role")
+        logger.info("Member %s exempt from verification (staff role); marked exempt in DB", member.id)
+        return
+
     if record and member_db_verified(record):
         logger.info("Member %s already verified; resyncing roles from allocations / DB", member)
         await resync_verified_member_roles(member, record, "Previously verified user rejoined")
+        return
+
+    if await try_auto_verify_from_allocation_discord_link(member):
+        logger.info("Member %s auto-verified on join via allocations.discord_email → projects from DB", member.id)
         return
 
     try:
@@ -1258,8 +1551,15 @@ async def run_full_verification_compliance_audit(
                     await revoke_member_access(member, "Compliance audit: access_revoked")
                     revoked_n += 1
                     continue
+                if member_is_verification_exempt(member):
+                    await resync_verified_member_roles(member, record, "Compliance audit: exempt role")
+                    verified_cleared += 1
+                    continue
                 if record and member_db_verified(record):
                     await resync_verified_member_roles(member, record, "Compliance audit: verified")
+                    verified_cleared += 1
+                    continue
+                if await try_auto_verify_from_allocation_discord_link(member):
                     verified_cleared += 1
                     continue
                 had = member_access_role_names(member)
@@ -1297,8 +1597,13 @@ async def sync_verification_roles_for_scoped_audit(
     if record and record.get("access_revoked"):
         await revoke_member_access(member, reason)
         return "revoked"
+    if member_is_verification_exempt(member):
+        await resync_verified_member_roles(member, record, reason)
+        return "verified"
     if record and member_db_verified(record):
         await resync_verified_member_roles(member, record, reason)
+        return "verified"
+    if await try_auto_verify_from_allocation_discord_link(member):
         return "verified"
     had = member_access_role_names(member)
     await revoke_member_access(member, reason)
@@ -1331,6 +1636,10 @@ async def timeout_cleanup_loop() -> None:
             except Exception as exc:
                 logger.warning("Could not fetch member %s: %s", uid, exc)
                 continue
+
+        if member_is_verification_exempt(member):
+            await db.mark_verification_exempt(guild.id, member)
+            continue
 
         try:
             await revoke_member_access(
