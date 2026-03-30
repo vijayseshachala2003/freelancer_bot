@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass, field
 from urllib.parse import quote_plus
 from datetime import datetime, timedelta, timezone
@@ -72,6 +73,7 @@ load_dotenv()
 # Optional:
 # LOG_LEVEL=INFO
 # STATUS_CHANNEL_NAME=bot-status
+# VERIFY_YOURSELF_TRIGGER_LOG=verify_yourself_triggers.log — JSONL when a verify notice posts in #verify-yourself (empty/false/off to disable)
 
 
 # ============================================================
@@ -87,6 +89,53 @@ UTC = timezone.utc
 
 # Discord channel name where the Verify panel lives (must match server; not configurable via env).
 VERIFY_CHANNEL_NAME = "verify-yourself"
+
+# JSONL: one line per @mention + Verify notice successfully posted in #verify-yourself.
+_vs_trigger_log_path_resolved: Optional[str] = None
+_vs_trigger_log_lock = threading.Lock()
+
+
+def _verify_yourself_trigger_log_path() -> Optional[str]:
+    """Path for JSONL trigger log, or None if disabled."""
+    global _vs_trigger_log_path_resolved
+    if _vs_trigger_log_path_resolved is not None:
+        return _vs_trigger_log_path_resolved or None
+    raw = os.getenv("VERIFY_YOURSELF_TRIGGER_LOG", "verify_yourself_triggers.log").strip()
+    if not raw or raw.lower() in ("none", "false", "0", "off"):
+        _vs_trigger_log_path_resolved = ""
+        return None
+    _vs_trigger_log_path_resolved = raw
+    return raw
+
+
+def log_verify_yourself_channel_notice(member: discord.Member, *, notice_trigger: str) -> None:
+    """Append one JSON line when a user is @mentioned with Verify in #verify-yourself."""
+    path = _verify_yourself_trigger_log_path()
+    if not path:
+        return
+    gn = getattr(member, "global_name", None)
+    rec = {
+        "ts": datetime.now(UTC).isoformat(),
+        "guild_id": str(member.guild.id),
+        "guild_name": member.guild.name,
+        "channel": VERIFY_CHANNEL_NAME,
+        "user_id": str(member.id),
+        "username": member.name,
+        "global_name": gn if gn else None,
+        "display_name": member.display_name,
+        "display": str(member),
+        "notice_trigger": notice_trigger,
+    }
+    line = json.dumps(rec, ensure_ascii=False) + "\n"
+    try:
+        d = os.path.dirname(os.path.abspath(path))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with _vs_trigger_log_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except OSError as exc:
+        logger.warning("VERIFY_YOURSELF_TRIGGER_LOG write failed (%s): %s", path, exc)
 
 # User-facing copy: what they must supply to pass verification / keep access.
 VERIFY_REQUIREMENTS_SHORT = (
@@ -1081,12 +1130,16 @@ async def send_status_message(guild: discord.Guild, content: str) -> None:
             logger.warning("Could not send status message: %s", e)
 
 
-async def send_verification_required_notice(member: discord.Member) -> None:
+async def send_verification_required_notice(
+    member: discord.Member, *, notice_trigger: str = "unspecified"
+) -> None:
     """
     Tell new gated members they must verify. Posts in the server first (not bot DMs):
     1) #verify-yourself  2) server system channel  3) DM last resort.
     Ensure the verify channel (or system channel) allows the Unverified role to *View Channel*
     if members must read the notice there.
+
+    notice_trigger: written to VERIFY_YOURSELF_TRIGGER_LOG when posted in #verify-yourself.
     """
     if member_is_verification_exempt(member):
         return
@@ -1111,6 +1164,7 @@ async def send_verification_required_notice(member: discord.Member) -> None:
         try:
             await verify_ch.send(f"{member.mention} {body}", view=VerifyView())
             logger.info("Verification notice posted in #%s for member %s", VERIFY_CHANNEL_NAME, member.id)
+            log_verify_yourself_channel_notice(member, notice_trigger=notice_trigger)
             return
         except discord.HTTPException as exc:
             logger.warning("Verification notice: could not send to #%s: %s", VERIFY_CHANNEL_NAME, exc)
@@ -1455,7 +1509,7 @@ async def on_member_join(member: discord.Member) -> None:
             leftover,
         )
     logger.info("Member joined and held until verify: %s", member)
-    await send_verification_required_notice(member)
+    await send_verification_required_notice(member, notice_trigger="member_join")
 
 
 # ============================================================
@@ -1498,7 +1552,9 @@ async def run_full_verification_compliance_audit(
                 had = member_access_role_names(member)
                 await revoke_member_access(member, "Compliance audit: not verified")
                 if had:
-                    await send_verification_required_notice(member)
+                    await send_verification_required_notice(
+                        member, notice_trigger="compliance_audit"
+                    )
                     stripped_notice += 1
                 # Yield so gateway/interaction handlers (e.g. Verify button) are not starved during long audits.
                 await asyncio.sleep(0)
@@ -1539,7 +1595,7 @@ async def sync_verification_roles_for_scoped_audit(
     had = member_access_role_names(member)
     await revoke_member_access(member, reason)
     if had:
-        await send_verification_required_notice(member)
+        await send_verification_required_notice(member, notice_trigger=reason)
     return "gated"
 
 
@@ -1698,7 +1754,7 @@ async def reset_verification_command(ctx: commands.Context, member: Optional[dis
         return
     await db.reset_user(target.id)
     await revoke_member_access(target, "Verification reset")
-    await send_verification_required_notice(target)
+    await send_verification_required_notice(target, notice_trigger="reset_verification")
     reset_view = VerifyView() if ctx.guild else None
     await ctx.reply(
         f"Verification reset for {target.mention}. Managed access roles removed until they verify again.",
@@ -1756,7 +1812,7 @@ async def revoke_access_command(ctx: commands.Context, member: Optional[discord.
         f"Admin revoke by {ctx.author}",
     )
     if ok:
-        await send_verification_required_notice(member)
+        await send_verification_required_notice(member, notice_trigger="revoke_access")
         await ctx.reply(
             f"Access revoked for {member.mention}. They can use **Verify** again after re-approval.",
             view=VerifyView(),

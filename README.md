@@ -21,6 +21,7 @@ There is **no** Discord-username field on allocations: verification is **only** 
 - **Compliance:** A **full guild audit** runs on startup (if enabled) and **every 30 minutes**—every member is checked against the database. A scoped admin command **`!audit_bluebird`** only processes members who currently hold at least one managed access role.
 - **Revoke pipeline:** Rows with `access_revoked = true` are polled and applied in Discord; admin **`!revoke_access`** clears access and re-notifies the member.
 - **HTTP health server:** Listens on `PORT` (default `8080`) for `GET /healthz` and `GET /readyz` (useful on Render and similar hosts).
+- **Verify-yourself audit file (optional):** `VERIFY_YOURSELF_TRIGGER_LOG` (default `verify_yourself_triggers.log`) appends one JSON line per user when the bot posts an `@mention` + **Verify now** notice in **`#verify-yourself`** (`notice_trigger` records join, compliance audit, Bluebird audit, reset, revoke, etc.).
 
 ## Requirements
 
@@ -56,6 +57,7 @@ Copy `env.example` to `.env` in the project root (loaded by `python-dotenv`). Re
 | `STATUS_CHANNEL_NAME` | No | If set, bot posts operational summaries (audits, timeouts, revokes) there. |
 | `PORT` | No | HTTP server port; default `8080`. |
 | `LOG_LEVEL` | No | Default `INFO`. |
+| `VERIFY_YOURSELF_TRIGGER_LOG` | No | Default `verify_yourself_triggers.log`: append one **JSON line** per user when a verify notice (mention + button) is posted in **`#verify-yourself`**. Set to empty, `false`, `off`, `none`, or `0` to disable. |
 | `VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED` | No | Default `true`: on connect, bot sets `#verify-yourself` so **@everyone** has **View Channel** denied and **Unverified** + bot allowed. Set `false` to leave channel permissions manual. Bot needs **Manage Channels**. |
 
 \*Either `DATABASE_URL` or `SUPABASE_DB_HOST` + `SUPABASE_DB_PASSWORD` must be set.
