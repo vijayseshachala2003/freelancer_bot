@@ -20,11 +20,11 @@ load_dotenv()
 # Discord Verification Bot
 # ------------------------------------------------------------
 # Features:
-# - Verify-first: managed access roles (MANAGED_ACCESS_ROLE_NAMES) are removed until verification succeeds; after verify, roles match `allocations.projects` (extras removed on sync)
+# - Verify-first: managed access roles are removed until verification succeeds; after verify, roles match **tokens in allocations.projects** (aliases in PROJECT_ROLE_ALIASES); only names in MANAGED_ACCESS_ROLE_NAMES are assignable; extras removed on sync
 # - Unverified + Unverified role gate channels; DB `status` = VERIFIED | NOT_VERIFIED (no Discord Verified role)
 # - New joins: strip managed access roles, gate, ping in #verify-yourself; existing members audited on startup the same way
 # - If someone has a managed access role but DB says not verified → strip access, gate, notice (compliance audit)
-# - Verified users: resync managed access roles from `allocations` (by canonical `email` PK), else from DB assigned_roles snapshot
+# - Verified users: resync managed access roles from `allocations.projects` (by canonical `email` PK), else from DB assigned_roles snapshot
 # - Hard revoke (!revoke_access / access_revoked): gate + strip managed access roles
 # - Admins: !kick / !ban — allocations.status REVOKE/BAN (by stored allocation email); !audit_bluebird — members with any managed access role
 # - VERIFICATION_EXEMPT_ROLE_NAMES (code): staff skip verify; marked DB exempt; no allocation resync / strip; Verify UI tells them they are exempt
@@ -65,7 +65,7 @@ load_dotenv()
 # VERIFICATION_TIMEOUT_HOURS=24
 # AUDIT_ON_STARTUP=true
 # When true, full compliance audit on boot (all members). Use !audit_bluebird for a scoped sweep.
-# Managed access Discord roles: edit MANAGED_ACCESS_ROLE_NAMES in this file (tuple below — not .env).
+# Managed access: MANAGED_ACCESS_ROLE_NAMES (whitelist) + optional PROJECT_ROLE_ALIASES; per-user tokens in allocations.projects.
 # Verification-exempt staff roles: VERIFICATION_EXEMPT_ROLE_NAMES in this file.
 # VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED=true (default): bot sets #verify-yourself visible only to Unverified + bot.
 #
@@ -97,48 +97,51 @@ VERIFY_REQUIREMENTS_SHORT = (
 VERIFY_PANEL_BODY = (
     "**Verification required** to use access channels.\n\n"
     "**What you need to provide:**\n"
-    "• **Deccan-associated mail address** — the email on your allocation (we match the email or Discord-linked email on that row)\n"
+    "• **Deccan-associated mail address** — must match **`allocations.email`** on your row\n"
     "• The allocation must be **active** and allowed to verify (not revoked or banned)\n\n"
     "Click **Verify now** below and enter your Deccan-associated email."
 )
 
 # =============================================================================
-# Project allocation (how it works)
+# Allocations + managed roles (how it works)
 # -----------------------------------------------------------------------------
-# 1) Table `allocations` (Postgres): one row per person, keyed by `email`. Columns include `projects` (text),
-#    `active`, `status` (ACTIVE / REVOKE / BAN), optional `discord_email`, etc.
+# Primary operator flow (minimal row: email + projects only — DB defaults active=true, status=ACTIVE):
+#   • INSERT row into allocations (email, projects)
+#   • User joins → bot strips managed access roles and gates (e.g. Unverified)
+#   • User clicks Verify now → enters the same email
+#   • Bot matches typed email to allocations.email (normalized) → assigns roles from allocations.projects
 #
-# 2) The `projects` column holds one or more tokens separated by comma, semicolon, slash, or pipe, e.g.:
-#      BB_Access, BB-Access, SomeOtherRole
-#    Each token must be the EXACT Discord role name as it appears in Server Settings → Roles, and each
-#    name must appear in MANAGED_ACCESS_ROLE_NAMES below. The bot does not build names from a suffix pattern.
+# 1) Table `allocations` (Postgres): one row per person, keyed by `email`. Used to decide **who may verify**
+#    (`active`, `status`) and **which** managed roles they get via the **`projects`** text column
+#    (comma / semicolon / slash / pipe separated tokens).
 #
-#    Optional `discord_email` on `allocations`: set this to the member's Discord username (`member.name`) or
-#    their global display name (`member.global_name`) — normalized, case/spacing-insensitive. When exactly one
-#    allocation row matches on join (or compliance), the bot auto-completes verification and assigns roles from
-#    that row's `projects` using the row's primary `email` as the canonical allocation key (no Discord user id
-#    stored on `allocations`).
+# 2) **`MANAGED_ACCESS_ROLE_NAMES`** is the whitelist: only those Discord role names may be assigned or held as
+#    managed access. Tokens in `projects` must resolve to one of those names (exact match, or via **PROJECT_ROLE_ALIASES**).
 #
-# 3) On successful verification, the bot matches the user's email to exactly one allocation row, reads
-#    `projects`, and syncs Discord: add each listed managed role (if it exists on the server) and **remove**
-#    any other MANAGED_ACCESS_ROLE_NAMES the member still has (e.g. from a manual invite or old allocation).
-#    Those same role names are also removed on revoke, gate, failed verify, and audit.
+# 3) On successful verification, the bot confirms the allocation row, then syncs Discord to the **projects** tokens
+#    (and **removes** any other managed roles). Same stripping on revoke, gate, failed verify, and audit.
 #
-# 4) Resync (verified users): same sync from the live `allocations` row by `email` (empty `projects` clears
-#    all managed access roles). If the allocation row is missing or not verifiable, uses the `assigned_roles`
-#    JSON snapshot on `discord_user_verification` as the allowed set.
+# 4) Resync (verified users): if the live allocation row is still verifiable, re-applies **`projects`** roles.
+#    If the row is missing or not verifiable, uses the `assigned_roles` JSON snapshot on `discord_user_verification`.
 #
-# 5) `!audit_bluebird` runs the scoped compliance pass on every member who currently has at least one role
-#    listed in MANAGED_ACCESS_ROLE_NAMES.
+# 5) `!audit_bluebird` runs the scoped compliance pass on every member who currently has at least one managed role.
 # =============================================================================
 
-# Exact Discord role names the bot may assign (from allocations.projects) and strip on revoke/gate/audit.
-# Case-sensitive — must match Server Settings → Roles. Add every project access role you use.
+# Exact Discord role names the bot is allowed to assign from `allocations.projects` (whitelist). Unlisted roles are
+# never assigned; any managed role not allowed for that user is removed on sync.
+# Case-sensitive — must match Server Settings → Roles.
 MANAGED_ACCESS_ROLE_NAMES: Tuple[str, ...] = (
     "BB_Access",
     "BB-Access",
     "AE-Access",
+    "matrix-QC",
+    "maitrix-coders",
+    "maitrix-non-coders",
 )
+
+# Optional: map short tokens stored in `allocations.projects` to exact names in MANAGED_ACCESS_ROLE_NAMES.
+# Example: {"BB": "BB_Access"}. Keys and values are case-sensitive.
+PROJECT_ROLE_ALIASES: Dict[str, str] = {}
 
 # Staff / ops roles: no verification flow; marked exempt in DB; not gated or stripped by compliance.
 # Case-sensitive — must match Server Settings → Roles exactly.
@@ -220,6 +223,11 @@ def get_settings() -> Settings:
         raise RuntimeError(
             "MANAGED_ACCESS_ROLE_NAMES in bot_verifier.py must contain at least one Discord role name."
         )
+    for alias_key, alias_val in PROJECT_ROLE_ALIASES.items():
+        if alias_val not in managed:
+            raise RuntimeError(
+                f"PROJECT_ROLE_ALIASES[{alias_key!r}] -> {alias_val!r} must be an entry in MANAGED_ACCESS_ROLE_NAMES."
+            )
 
     settings = Settings(
         discord_token=require("DISCORD_TOKEN"),
@@ -256,16 +264,6 @@ def norm_str(value: Any) -> str:
     return re.sub(r"\s+", "", str(value).strip().lower())
 
 
-def split_projects_str(value: Any) -> List[str]:
-    if value is None:
-        return []
-    text = str(value).strip()
-    if not text:
-        return []
-    parts = re.split(r"[,;/|]+", text)
-    return [p.strip() for p in parts if p and p.strip()]
-
-
 def allocation_row_is_active(row: Dict[str, Any]) -> bool:
     v = row.get("active", True)
     if isinstance(v, bool):
@@ -290,10 +288,27 @@ def allocation_row_can_verify(row: Dict[str, Any]) -> bool:
     return allocation_status_allows_verify(row)
 
 
-def get_projects_from_allocation(row: Dict[str, Any]) -> List[str]:
+_PROJECT_SEP_RE = re.compile(r"[,;/|]+")
+
+
+def split_projects_str(projects: Any) -> List[str]:
+    """Split `allocations.projects` text on comma, semicolon, slash, or pipe; trim whitespace; drop empties."""
+    if projects is None:
+        return []
+    s = str(projects).strip()
+    if not s:
+        return []
+    return [p.strip() for p in _PROJECT_SEP_RE.split(s) if p.strip()]
+
+
+def get_managed_role_tokens_for_verified_allocation(row: Dict[str, Any]) -> List[str]:
+    """
+    If the allocation row allows verification, return role tokens from `allocations.projects` (deduped, order kept).
+    Each token must resolve via PROJECT_ROLE_ALIASES or exact name to MANAGED_ACCESS_ROLE_NAMES to be assigned.
+    """
     if not allocation_row_can_verify(row):
         return []
-    return split_projects_str(row.get("projects"))
+    return list(dict.fromkeys(split_projects_str(row.get("projects"))))
 
 
 # ============================================================
@@ -363,7 +378,6 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS allocations (
                     email TEXT PRIMARY KEY,
-                    discord_email TEXT,
                     full_name TEXT,
                     projects TEXT,
                     active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -371,8 +385,6 @@ class Database:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_allocations_discord_email ON allocations (discord_email);
 
                 ALTER TABLE allocations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ACTIVE';
                 UPDATE allocations SET status = 'ACTIVE' WHERE status IS NULL OR status = '';
@@ -399,6 +411,9 @@ class Database:
                     END IF;
                 END
                 $migrate_allocations$;
+
+                DROP INDEX IF EXISTS idx_allocations_discord_email;
+                ALTER TABLE allocations DROP COLUMN IF EXISTS discord_email;
                 """
             )
 
@@ -705,7 +720,7 @@ class Database:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT email, discord_email, full_name, projects, active, status
+                SELECT email, full_name, projects, active, status
                 FROM allocations
                 """
             )
@@ -720,7 +735,7 @@ class Database:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT email, discord_email, full_name, projects, active, status
+                SELECT email, full_name, projects, active, status
                 FROM allocations
                 WHERE email = $1
                 """,
@@ -729,12 +744,12 @@ class Database:
         return dict(row) if row else None
 
     async def find_allocation_match(self, email: str) -> Tuple[bool, Optional[Dict[str, Any]], str]:
-        """Match a single allocation row by normalized email or discord_email."""
+        """Match Verify-modal input to **allocations.email** (normalized: lowercase, whitespace removed)."""
         rows = await self.fetch_allocations()
         email_n = norm_str(email)
         matches: List[Dict[str, Any]] = []
         for row in rows:
-            row_email = norm_str(row.get("email") or row.get("discord_email"))
+            row_email = norm_str(row.get("email"))
             if row_email == email_n:
                 matches.append(row)
 
@@ -753,27 +768,6 @@ class Database:
                 return False, row, "Allocation is inactive (active=false)."
             return False, row, "This allocation is revoked or banned."
         return True, row, "matched"
-
-    async def fetch_allocations_matching_discord_link_handle(self, handle: str) -> List[Dict[str, Any]]:
-        """Allocations whose `discord_email` field matches this handle (norm_str equality)."""
-        nh = norm_str(handle)
-        if not nh:
-            return []
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT email, discord_email, full_name, projects, active, status
-                FROM allocations
-                WHERE discord_email IS NOT NULL AND BTRIM(discord_email) != ''
-                """
-            )
-        out: List[Dict[str, Any]] = []
-        for r in rows:
-            d = dict(r)
-            if norm_str(d.get("discord_email")) == nh:
-                out.append(d)
-        return out
 
 
 # ============================================================
@@ -855,13 +849,15 @@ def is_access_role_name(name: str) -> bool:
 
 def resolve_project_role(guild: discord.Guild, project_token: str) -> Optional[discord.Role]:
     """
-    Resolve an `allocations.projects` token to a guild role.
-    Token must exactly match a name in MANAGED_ACCESS_ROLE_NAMES and exist on the server.
+    Resolve a token from `allocations.projects` to a guild role: optional PROJECT_ROLE_ALIASES, then whitelist check.
     """
     t = project_token.strip()
-    if not t or t not in SETTINGS.managed_access_role_names:
+    if not t:
         return None
-    return get_role(guild, t)
+    name = PROJECT_ROLE_ALIASES.get(t, t)
+    if name not in SETTINGS.managed_access_role_names:
+        return None
+    return get_role(guild, name)
 
 
 def members_with_any_managed_access_role(guild: discord.Guild) -> List[discord.Member]:
@@ -916,18 +912,18 @@ async def remove_all_access_roles(member: discord.Member) -> List[str]:
     return removed
 
 
-def allowed_managed_access_names_for_projects(
-    guild: discord.Guild, project_tokens: List[str]
+def allowed_managed_access_names_from_tokens(
+    guild: discord.Guild, role_tokens: List[str]
 ) -> frozenset[str]:
-    """Discord role names the allocation allows (tokens resolved on this guild)."""
+    """Resolve `allocations.projects` tokens (after aliases) to Discord roles present on this guild."""
     names: set[str] = set()
-    for token in project_tokens:
+    for token in role_tokens:
         role = resolve_project_role(guild, token)
         if role:
             names.add(role.name)
         else:
             logger.warning(
-                "Project token '%s' not in MANAGED_ACCESS_ROLE_NAMES or no Discord role with that exact name on server",
+                "projects token '%s' did not resolve (not in MANAGED_ACCESS_ROLE_NAMES / PROJECT_ROLE_ALIASES, or no matching role on server)",
                 token,
             )
     return frozenset(names)
@@ -1015,8 +1011,8 @@ async def resync_verified_member_roles(member: discord.Member, record: Any, reas
     if alloc_email:
         alloc = await db.fetch_allocation_by_email(alloc_email)
     if alloc and allocation_row_can_verify(alloc):
-        projects = get_projects_from_allocation(alloc)
-        allowed = allowed_managed_access_names_for_projects(member.guild, projects)
+        tokens = get_managed_role_tokens_for_verified_allocation(alloc)
+        allowed = allowed_managed_access_names_from_tokens(member.guild, tokens)
         await sync_managed_access_roles(member, allowed, reason)
         return
     assigned_roles = record.get("assigned_roles") or [] if record else []
@@ -1028,62 +1024,6 @@ async def resync_verified_member_roles(member: discord.Member, record: Any, reas
         if s in SETTINGS.managed_access_role_names
     )
     await sync_managed_access_roles(member, allowed, f"{reason} (DB snapshot)")
-
-
-async def try_auto_verify_from_allocation_discord_link(member: discord.Member) -> bool:
-    """
-    If exactly one verifiable allocation row has `discord_email` matching this member's Discord username
-    or global display name (normalized), complete verification and apply `projects` from that row.
-    Canonical allocation key remains `allocations.email` (PK), not Discord user id.
-    """
-    if member.bot:
-        return False
-    if member_is_verification_exempt(member):
-        return False
-
-    candidates: Dict[str, Dict[str, Any]] = {}
-    handles: List[str] = [member.name]
-    gn = getattr(member, "global_name", None)
-    if gn and str(gn).strip():
-        handles.append(str(gn).strip())
-
-    for h in handles:
-        for row in await db.fetch_allocations_matching_discord_link_handle(h):
-            em = str(row.get("email") or "").strip()
-            if em:
-                candidates[em] = row
-
-    if len(candidates) != 1:
-        if len(candidates) > 1:
-            logger.warning(
-                "Auto-verify skipped for member %s: multiple allocations match discord_email / display (%s rows)",
-                member.id,
-                len(candidates),
-            )
-        return False
-
-    row = next(iter(candidates.values()))
-    if not allocation_row_can_verify(row):
-        logger.info(
-            "Auto-verify skipped for member %s: allocation %s not verifiable",
-            member.id,
-            row.get("email"),
-        )
-        return False
-
-    typed = str(row.get("email") or "").strip()
-    try:
-        await finalize_verified_member(member, row, typed_email=typed)
-    except Exception:
-        logger.exception("Auto-verify finalize failed for member %s", member.id)
-        return False
-
-    logger.info(
-        "Auto-verified member %s from allocations.discord_email → allocation email=%s",
-        member.id,
-        typed,
-    )
-    return True
 
 
 def member_access_role_names(member: discord.Member) -> List[str]:
@@ -1106,15 +1046,15 @@ async def finalize_verified_member(
     member: discord.Member, source_row: Dict[str, Any], typed_email: str
 ) -> Tuple[List[str], List[str]]:
     """
-    Identity verified: remove Unverified / legacy Verified; assign managed access roles from `allocations.projects`; DB status=VERIFIED.
+    Identity verified: remove Unverified / legacy Verified; assign managed roles from `allocations.projects`.
     Stores canonical `allocations.email` (PK) on the verification row for resync and kick/ban.
-    Returns (projects_logged, assigned_role_names).
+    Returns (role_tokens_logged, assigned_role_names).
     """
     canonical_email = str(source_row.get("email") or "").strip() or typed_email.strip()
     await remove_role_if_present(member, SETTINGS.unverified_role_name, "Verification success")
     await remove_role_if_present(member, SETTINGS.verified_role_name, "Verification success (legacy Verified role)")
-    projects_logged = get_projects_from_allocation(source_row)
-    allowed = allowed_managed_access_names_for_projects(member.guild, projects_logged)
+    tokens_logged = get_managed_role_tokens_for_verified_allocation(source_row)
+    allowed = allowed_managed_access_names_from_tokens(member.guild, tokens_logged)
     assigned_roles = await sync_managed_access_roles(
         member, allowed, "Verification success: allocation projects"
     )
@@ -1123,11 +1063,11 @@ async def finalize_verified_member(
         guild_id=member.guild.id,
         member_name=str(member),
         email=canonical_email,
-        assigned_projects=projects_logged,
+        assigned_projects=tokens_logged,
         assigned_roles=assigned_roles,
         source_row=source_row,
     )
-    return projects_logged, assigned_roles
+    return tokens_logged, assigned_roles
 
 
 async def send_status_message(guild: discord.Guild, content: str) -> None:
@@ -1295,7 +1235,7 @@ class VerifyModal(discord.ui.Modal, title="Discord Access Verification"):
             return
 
         try:
-            projects_logged, assigned_roles = await finalize_verified_member(
+            tokens_logged, assigned_roles = await finalize_verified_member(
                 interaction.user,
                 source_row=row,
                 typed_email=email,
@@ -1308,13 +1248,13 @@ class VerifyModal(discord.ui.Modal, title="Discord Access Verification"):
             )
             return
 
-        project_text = ", ".join(projects_logged) if projects_logged else "None (allocation row)"
-        role_text = ", ".join(assigned_roles) if assigned_roles else "No matching managed access roles on server (check MANAGED_ACCESS_ROLE_NAMES and Discord role names)"
+        token_text = ", ".join(tokens_logged) if tokens_logged else "None (empty or unverifiable allocation)"
+        role_text = ", ".join(assigned_roles) if assigned_roles else "No matching managed access roles on server (check allocations.projects, MANAGED_ACCESS_ROLE_NAMES, aliases, and Discord role names)"
         await interaction.followup.send(
             f"Verification successful.\n"
             f"Discord user ID (stored): `{interaction.user.id}`\n"
-            f"Allocation projects: {project_text}\n"
-            f"Roles assigned: {role_text}",
+            f"Role tokens (from allocations.projects): {token_text}\n"
+            f"Roles assigned on server: {role_text}",
             ephemeral=True,
         )
         canon = str(row.get("email") or "").strip()
@@ -1500,10 +1440,6 @@ async def on_member_join(member: discord.Member) -> None:
         await resync_verified_member_roles(member, record, "Previously verified user rejoined")
         return
 
-    if await try_auto_verify_from_allocation_discord_link(member):
-        logger.info("Member %s auto-verified on join via allocations.discord_email → projects from DB", member.id)
-        return
-
     try:
         await revoke_member_access(member, "New member: verify before access roles")
     except discord.Forbidden:
@@ -1559,9 +1495,6 @@ async def run_full_verification_compliance_audit(
                     await resync_verified_member_roles(member, record, "Compliance audit: verified")
                     verified_cleared += 1
                     continue
-                if await try_auto_verify_from_allocation_discord_link(member):
-                    verified_cleared += 1
-                    continue
                 had = member_access_role_names(member)
                 await revoke_member_access(member, "Compliance audit: not verified")
                 if had:
@@ -1602,8 +1535,6 @@ async def sync_verification_roles_for_scoped_audit(
         return "verified"
     if record and member_db_verified(record):
         await resync_verified_member_roles(member, record, reason)
-        return "verified"
-    if await try_auto_verify_from_allocation_discord_link(member):
         return "verified"
     had = member_access_role_names(member)
     await revoke_member_access(member, reason)
@@ -1742,7 +1673,7 @@ def is_admin(member: discord.Member) -> bool:
 @bot.command(name="helpme")
 async def helpme_command(ctx: commands.Context) -> None:
     text = (
-        "**Verify first:** managed access roles (see `MANAGED_ACCESS_ROLE_NAMES` in bot_verifier.py) are removed until you complete verification. After verify, roles are assigned from `allocations.projects`.\n"
+        "**Verify first:** managed access roles (see `MANAGED_ACCESS_ROLE_NAMES` in bot_verifier.py) are removed until you complete verification. After verify, roles follow **`allocations.projects`** for your allocation (whitelist + optional aliases in code).\n"
         + VERIFY_REQUIREMENTS_SHORT
         + "\n"
         "Use **Verify now** below (or in **#verify-yourself**).\n"

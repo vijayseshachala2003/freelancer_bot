@@ -1,15 +1,23 @@
 # Freelancer Bot — Discord verification (`bot_verifier.py`)
 
-A single-process Discord bot that enforces **verify-before-access** for a configured set of **managed access** roles. It reads allocations from **PostgreSQL** (including Supabase), syncs Discord roles to match `allocations.projects`, and strips roles that are not authorized by the database.
+A single-process Discord bot that enforces **verify-before-access** for a configured set of **managed access** roles. It reads **`allocations`** in **PostgreSQL** to decide **who may verify** and **which** roles each person gets from the **`projects`** column (comma / semicolon / slash / pipe separated tokens). **`MANAGED_ACCESS_ROLE_NAMES`** in `bot_verifier.py` is the **whitelist** of Discord role names the bot may assign; optional **`PROJECT_ROLE_ALIASES`** maps short DB tokens to those names. Any other managed role on the member is removed on sync/revoke/gate.
+
+## Verification flow (intended)
+
+1. **Add a row** to **`allocations`** with at least **`email`** and **`projects`**. Other columns use table defaults (`active=true`, `status=ACTIVE` unless you changed the schema).
+2. **User joins** the server → the bot **removes** managed access roles and **gates** them (e.g. **Unverified**), then nudges them to verify.
+3. **User clicks Verify now** and types the **same email** as **`allocations.email`**.
+4. The bot **matches** that input to **`allocations.email`** (comparison is normalized: case-insensitive, all whitespace removed) and **assigns Discord roles** from **`allocations.projects`** (via the whitelist and optional aliases in code).
+
+There is **no** Discord-username field on allocations: verification is **only** via the **Verify now** modal (and compliance rules for already-verified users).
 
 ## Features
 
 - **Verify-first gating:** Users get the configured **Unverified** role until they complete verification. Managed access roles (see `MANAGED_ACCESS_ROLE_NAMES` in code) are removed on join, failed checks, revoke, and timeout until the user is verified.
 - **Staff exempt roles:** Members with any role in **`VERIFICATION_EXEMPT_ROLE_NAMES`** (in `bot_verifier.py`, e.g. Admin, Support, managers) are treated as **automatically exempt**: marked in the DB as `verification_status=exempt`, never gated or stripped by compliance, and **not** resynced from `allocations` (their Discord roles stay as you set them). They do not need the Verify modal.
-- **Modal verification:** A persistent **Verify now** button opens a modal for the user’s **Deccan-associated email**; the bot matches it to the `allocations` table (and optional `discord_email`).
-- **Role sync from DB:** On success and on resync, Discord roles are aligned with `allocations.projects` tokens. Any managed access role the member has that is **not** in their current allocation is **removed** (manual invites or stale roles).
+- **Modal verification:** A persistent **Verify now** button opens a modal for the user’s **Deccan-associated email**; the bot matches it to **`allocations.email`**.
+- **Role sync from DB `projects`:** After verify (and on resync while the allocation row is still valid), the bot applies only the tokens in that row’s **`allocations.projects`** (each must resolve to a name in **`MANAGED_ACCESS_ROLE_NAMES`**, or use **`PROJECT_ROLE_ALIASES`**). Any other managed role on the member is **removed**. To change a user’s access, edit their **`projects`** text in Postgres; next verify/resync applies.
 - **Channel `#verify-yourself`:** Name is fixed in code (`VERIFY_CHANNEL_NAME`). On startup the bot can set **channel permissions** so **@everyone** cannot view the channel and only **Unverified** + the **bot** can (see `VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED`). That way verify notices and the panel are visible mainly to people who still need to verify. The bot posts a verify panel once if missing; notices and several commands attach **Verify now** where possible.
-- **Auto-link from `allocations.discord_email`:** If exactly one active allocation row has `discord_email` set to the member’s Discord **username** or **global display name** (normalized), the bot can verify them automatically on join or at the next compliance pass and apply roles from that row’s **`projects`** (canonical key remains **`allocations.email`**).
 - **Compliance:** A **full guild audit** runs on startup (if enabled) and **every 30 minutes**—every member is checked against the database. A scoped admin command **`!audit_bluebird`** only processes members who currently hold at least one managed access role.
 - **Revoke pipeline:** Rows with `access_revoked = true` are polled and applied in Discord; admin **`!revoke_access`** clears access and re-notifies the member.
 - **HTTP health server:** Listens on `PORT` (default `8080`) for `GET /healthz` and `GET /readyz` (useful on Render and similar hosts).
@@ -54,7 +62,9 @@ Copy `env.example` to `.env` in the project root (loaded by `python-dotenv`). Re
 
 ### Managed access roles (not in `.env`)
 
-Edit the tuple **`MANAGED_ACCESS_ROLE_NAMES`** near the top of `bot_verifier.py`. Each entry must be the **exact** Discord role name. The tuple must be non-empty at startup. Every token in `allocations.projects` must be listed here, or the bot will not assign that role.
+Edit the tuple **`MANAGED_ACCESS_ROLE_NAMES`** near the top of `bot_verifier.py`. Each entry must be the **exact** Discord role name. The tuple must be non-empty at startup. Only these names may be assigned from **`allocations.projects`**; add new Discord roles here before using them in Postgres.
+
+Edit **`PROJECT_ROLE_ALIASES`** in the same file if you store short tokens in **`projects`** (e.g. `BB` → `BB_Access`); every **value** must appear in **`MANAGED_ACCESS_ROLE_NAMES`**.
 
 Edit **`VERIFICATION_EXEMPT_ROLE_NAMES`** in the same file for staff who skip verification (exact role names).
 
@@ -62,12 +72,10 @@ Edit **`VERIFICATION_EXEMPT_ROLE_NAMES`** in the same file for staff who skip ve
 
 On connect, the bot runs `init_schema()` and ensures tables exist (and applies light migrations):
 
-- **`allocations`** — Primary key `email`; includes `projects` (text), `active`, `status` (e.g. ACTIVE / REVOKE / BAN), `discord_email`, timestamps.
-- **`discord_user_verification`** — One row per Discord user ID; verification state, `assigned_projects` / `assigned_roles` JSON, `access_revoked`, `status` (VERIFIED / NOT_VERIFIED), etc.
+- **`allocations`** — Primary key `email`; **`projects`** (text: tokens separated by **`,` `;` `/` `|`**), `active`, `status` (e.g. ACTIVE / REVOKE / BAN), optional `full_name`, timestamps. On upgrade, the bot **drops** `discord_email` if it existed (verification is email-only via the modal).
+- **`discord_user_verification`** — One row per Discord user ID; verification state, `assigned_projects` / `assigned_roles` JSON (snapshots for display / fallback resync), `access_revoked`, `status` (VERIFIED / NOT_VERIFIED), etc.
 
-The `projects` column uses separators **`,` `;` `/` `|`** between tokens. Each token is a Discord role name that must appear in `MANAGED_ACCESS_ROLE_NAMES`.
-
-Optional **`discord_email`** on an allocation: use the member’s Discord username (or global name) to allow **automatic** verification and role sync from **`projects`** without storing a Discord user id on `allocations`.
+Each token in **`projects`** must map to a Discord role name in **`MANAGED_ACCESS_ROLE_NAMES`** (or via **`PROJECT_ROLE_ALIASES`**).
 
 ## Running the bot
 
