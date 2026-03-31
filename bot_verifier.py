@@ -196,14 +196,13 @@ VERIFY_DM_BODY = (
 # never assigned; any managed role not allowed for that user is removed on sync.
 # Case-sensitive — must match Server Settings → Roles.
 MANAGED_ACCESS_ROLE_NAMES: Tuple[str, ...] = (
-    "BB_Access",
-    "BB-Access",
-    "AE-Access",
-    "matrix-QC",
+    "maitrix-QC-coders",
     "maitrix-coders",
     "maitrix-non-coders",
+    "maitrix-non_coders-QC",
+    "AE_Access",
+    "BB_Access",
 )
-
 # Optional: map short tokens stored in `allocations.projects` to exact names in MANAGED_ACCESS_ROLE_NAMES.
 # Example: {"BB": "BB_Access"}. Keys and values are case-sensitive.
 PROJECT_ROLE_ALIASES: Dict[str, str] = {}
