@@ -23,15 +23,14 @@ load_dotenv()
 # Features:
 # - Verify-first: managed access roles are removed until verification succeeds; after verify, roles match **tokens in allocations.projects** (aliases in PROJECT_ROLE_ALIASES); only names in MANAGED_ACCESS_ROLE_NAMES are assignable; extras removed on sync
 # - Unverified + Unverified role gate channels; DB `status` = VERIFIED | NOT_VERIFIED (no Discord Verified role)
-# - New joins: strip managed access roles, gate, ping in #verify-yourself; existing members audited on startup the same way
-# - If someone has a managed access role but DB says not verified → strip access, gate, notice (compliance audit)
+# - New joins: strip managed access roles, gate, **DM** with Verify now + email modal; existing members audited on startup the same way
+# - If someone has a managed access role but DB says not verified → strip access, gate, DM notice (compliance audit)
 # - Verified users: resync managed access roles from `allocations.projects` (by canonical `email` PK), else from DB assigned_roles snapshot
 # - Hard revoke (!revoke_access / access_revoked): gate + strip managed access roles
 # - Admins: !kick / !ban — allocations.status REVOKE/BAN (by stored allocation email); !audit_bluebird — members with any managed access role
 # - VERIFICATION_EXEMPT_ROLE_NAMES (code): staff skip verify; marked DB exempt; no allocation resync / strip; Verify UI tells them they are exempt
-# - On ready: optional channel overwrites on #verify-yourself — deny @everyone view, allow Unverified + bot (VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED)
+# - On ready: no auto #verify-yourself setup (verification invites are **DM-only**; VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED unused by stubs)
 # - Timeout: strip managed access roles + gate; verification state in PostgreSQL / Supabase
-# - #verify-yourself: bot ensures a **Verify now** panel message exists (posted once if missing)
 #
 # Discord Developer Portal (Bot → Privileged Gateway Intents):
 #   - Server Members Intent — required (member list, roles, on_member_join).
@@ -40,9 +39,9 @@ load_dotenv()
 # Channel permissions (gate model): gated categories/channels must allow invite roles (e.g. BB_Access) and
 # explicitly deny Unverified for View Channel (or equivalent), or users will not be blocked despite DB logic.
 #
-# "Only #verify-yourself until verified" (Discord-side, required):
+# Gate model (Discord-side):
 # - On categories/channels for real content: @everyone View=Deny (or leave off), BB_Access View=Allow, Unverified View=Deny.
-# - On #verify-yourself: Unverified View=Allow (and @everyone or Unverified can read).
+# - Users verify via **bot DM** (Allow DMs from server members). Optional manual #verify-yourself is up to you.
 # - Prefer invites that do NOT auto-grant managed access roles; the bot strips them on join and assigns after verify.
 # - Bot role must be ABOVE BB_Access / BB-Access in Role list and have Manage Roles or strips fail silently.
 # ============================================================
@@ -68,12 +67,13 @@ load_dotenv()
 # When true, full compliance audit on boot (all members). Use !audit_bluebird for a scoped sweep.
 # Managed access: MANAGED_ACCESS_ROLE_NAMES (whitelist) + optional PROJECT_ROLE_ALIASES; per-user tokens in allocations.projects.
 # Verification-exempt staff roles: VERIFICATION_EXEMPT_ROLE_NAMES in this file.
-# VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED=true (default): bot sets #verify-yourself visible only to Unverified + bot.
+# VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED — unused while in-channel verify stubs are disabled (DM-only flow).
 #
 # Optional:
 # LOG_LEVEL=INFO
 # STATUS_CHANNEL_NAME=bot-status
-# VERIFY_YOURSELF_TRIGGER_LOG=verify_yourself_triggers.log — JSONL when a verify notice posts in #verify-yourself (empty/false/off to disable)
+# VERIFY_YOURSELF_TRIGGER_LOG=verify_yourself_triggers.log — JSONL per invite delivered (dm or channel_fallback; empty/false/off to disable)
+# VERIFICATION_DM_RETRY_COOLDOWN_MINUTES=20 — min minutes between on_ready DM retries when verification_invite_dm_ok is false
 
 
 # ============================================================
@@ -90,13 +90,13 @@ UTC = timezone.utc
 # Discord channel name where the Verify panel lives (must match server; not configurable via env).
 VERIFY_CHANNEL_NAME = "verify-yourself"
 
-# JSONL: one line per @mention + Verify notice successfully posted in #verify-yourself.
+# JSONL: one line per verification DM sent (env VERIFY_YOURSELF_TRIGGER_LOG — name kept for compatibility).
 _vs_trigger_log_path_resolved: Optional[str] = None
 _vs_trigger_log_lock = threading.Lock()
 
 
-def _verify_yourself_trigger_log_path() -> Optional[str]:
-    """Path for JSONL trigger log, or None if disabled."""
+def _verification_notice_log_path() -> Optional[str]:
+    """Path for JSONL verification-notice log, or None if disabled."""
     global _vs_trigger_log_path_resolved
     if _vs_trigger_log_path_resolved is not None:
         return _vs_trigger_log_path_resolved or None
@@ -108,17 +108,23 @@ def _verify_yourself_trigger_log_path() -> Optional[str]:
     return raw
 
 
-def log_verify_yourself_channel_notice(member: discord.Member, *, notice_trigger: str) -> None:
-    """Append one JSON line when a user is @mentioned with Verify in #verify-yourself."""
-    path = _verify_yourself_trigger_log_path()
+def log_verification_notice_sent(
+    member: discord.Member,
+    *,
+    notice_trigger: str,
+    delivery: str,
+    fallback_channel: Optional[str] = None,
+) -> None:
+    """Append one JSON line when a verification invite is delivered (DM or public channel fallback)."""
+    path = _verification_notice_log_path()
     if not path:
         return
     gn = getattr(member, "global_name", None)
-    rec = {
+    rec: Dict[str, Any] = {
         "ts": datetime.now(UTC).isoformat(),
+        "delivery": delivery,
         "guild_id": str(member.guild.id),
         "guild_name": member.guild.name,
-        "channel": VERIFY_CHANNEL_NAME,
         "user_id": str(member.id),
         "username": member.name,
         "global_name": gn if gn else None,
@@ -126,6 +132,8 @@ def log_verify_yourself_channel_notice(member: discord.Member, *, notice_trigger
         "display": str(member),
         "notice_trigger": notice_trigger,
     }
+    if fallback_channel:
+        rec["fallback_channel"] = fallback_channel
     line = json.dumps(rec, ensure_ascii=False) + "\n"
     try:
         d = os.path.dirname(os.path.abspath(path))
@@ -135,7 +143,7 @@ def log_verify_yourself_channel_notice(member: discord.Member, *, notice_trigger
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line)
     except OSError as exc:
-        logger.warning("VERIFY_YOURSELF_TRIGGER_LOG write failed (%s): %s", path, exc)
+        logger.warning("verification notice log write failed (%s): %s", path, exc)
 
 # User-facing copy: what they must supply to pass verification / keep access.
 VERIFY_REQUIREMENTS_SHORT = (
@@ -143,6 +151,7 @@ VERIFY_REQUIREMENTS_SHORT = (
     "(not revoked or banned)."
 )
 
+# Optional in-server panel text (in-channel panel auto-post is disabled; verification invites are DM-only).
 VERIFY_PANEL_BODY = (
     "**Verification required** to use access channels.\n\n"
     "**What you need to provide:**\n"
@@ -151,13 +160,20 @@ VERIFY_PANEL_BODY = (
     "Click **Verify now** below and enter your Deccan-associated email."
 )
 
+# DM copy: user taps Verify now here and submits email in the modal (same flow as in-server button).
+VERIFY_DM_BODY = (
+    "**Verification required** for server channel access.\n\n"
+    + VERIFY_REQUIREMENTS_SHORT
+    + "\n\nTap **Verify now** below and enter your **email** in the form (must match **`allocations.email`**)."
+)
+
 # =============================================================================
 # Allocations + managed roles (how it works)
 # -----------------------------------------------------------------------------
 # Primary operator flow (minimal row: email + projects only — DB defaults active=true, status=ACTIVE):
 #   • INSERT row into allocations (email, projects)
-#   • User joins → bot strips managed access roles and gates (e.g. Unverified)
-#   • User clicks Verify now → enters the same email
+#   • User joins → bot strips managed access roles and gates (e.g. Unverified), **DM** with Verify now
+#   • User taps Verify now (DM or !helpme) → enters the same email
 #   • Bot matches typed email to allocations.email (normalized) → assigns roles from allocations.projects
 #
 # 1) Table `allocations` (Postgres): one row per person, keyed by `email`. Used to decide **who may verify**
@@ -220,6 +236,7 @@ class Settings:
     managed_access_role_names: frozenset[str] = field(default_factory=frozenset)
     verification_exempt_role_names: frozenset[str] = field(default_factory=frozenset)
     restrict_verify_channel_to_unverified: bool = True
+    verification_dm_retry_cooldown_minutes: int = 20
 
 
 def resolve_database_url() -> str:
@@ -294,6 +311,9 @@ def get_settings() -> Settings:
             "VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED", "true"
         ).lower()
         in ("1", "true", "yes"),
+        verification_dm_retry_cooldown_minutes=max(
+            1, int(os.getenv("VERIFICATION_DM_RETRY_COOLDOWN_MINUTES", "20"))
+        ),
     )
 
     if missing:
@@ -305,6 +325,16 @@ def get_settings() -> Settings:
 SETTINGS = get_settings()
 
 PORT = int(os.getenv("PORT", "8080"))
+
+# One reconnect/retry sweep at a time (on_ready may fire multiple times).
+_verification_invite_retry_lock: Optional[asyncio.Lock] = None
+
+
+def _verification_invite_retry_lock_get() -> asyncio.Lock:
+    global _verification_invite_retry_lock
+    if _verification_invite_retry_lock is None:
+        _verification_invite_retry_lock = asyncio.Lock()
+    return _verification_invite_retry_lock
 
 
 def norm_str(value: Any) -> str:
@@ -425,6 +455,11 @@ class Database:
                 ALTER TABLE discord_user_verification ALTER COLUMN status SET DEFAULT 'NOT_VERIFIED';
                 ALTER TABLE discord_user_verification ALTER COLUMN status SET NOT NULL;
 
+                ALTER TABLE discord_user_verification
+                ADD COLUMN IF NOT EXISTS verification_invite_dm_ok BOOLEAN NOT NULL DEFAULT FALSE;
+                ALTER TABLE discord_user_verification
+                ADD COLUMN IF NOT EXISTS verification_invite_last_attempt_at TIMESTAMPTZ;
+
                 CREATE TABLE IF NOT EXISTS allocations (
                     email TEXT PRIMARY KEY,
                     full_name TEXT,
@@ -491,6 +526,57 @@ class Database:
             return await conn.fetchrow(
                 "SELECT * FROM discord_user_verification WHERE discord_user_id = $1",
                 str(discord_user_id),
+            )
+
+    async def record_verification_invite_outcome(
+        self, discord_user_id: int, *, dm_ok: bool, guild_id: int
+    ) -> None:
+        """Track whether the last invite was delivered by DM; always bumps last_attempt_at for retry cooldown."""
+        assert self.pool is not None
+        uid = str(discord_user_id)
+        gid = str(guild_id)
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO discord_user_verification (
+                    discord_user_id, guild_id,
+                    verification_invite_dm_ok, verification_invite_last_attempt_at, last_seen_at
+                ) VALUES ($1, $2, $3, NOW(), NOW())
+                ON CONFLICT (discord_user_id) DO UPDATE SET
+                    verification_invite_dm_ok = EXCLUDED.verification_invite_dm_ok,
+                    verification_invite_last_attempt_at = NOW(),
+                    last_seen_at = NOW();
+                """,
+                uid,
+                gid,
+                dm_ok,
+            )
+
+    async def list_discord_user_ids_pending_invite_dm_retry(
+        self, guild_id: str, min_minutes_since_attempt: int
+    ) -> List[asyncpg.Record]:
+        """
+        Users who still need verification, never got a successful DM invite (dm_ok=false), and are past cooldown
+        since last attempt — used to re-try DM after bot restart / reconnect (transient failures).
+        """
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT discord_user_id
+                FROM discord_user_verification
+                WHERE guild_id = $1
+                  AND status = 'NOT_VERIFIED'
+                  AND COALESCE(access_revoked, FALSE) = FALSE
+                  AND verification_invite_dm_ok = FALSE
+                  AND COALESCE(verification_status, '') <> 'exempt'
+                  AND (
+                    verification_invite_last_attempt_at IS NULL
+                    OR verification_invite_last_attempt_at < NOW() - ($2::int * INTERVAL '1 minute')
+                  )
+                """,
+                guild_id,
+                min_minutes_since_attempt,
             )
 
     async def mark_failed_attempt(self, discord_user_id: int, error: str) -> None:
@@ -562,7 +648,8 @@ class Database:
                     removed_for_timeout = FALSE,
                     access_revoked = FALSE,
                     status = 'VERIFIED',
-                    last_error = NULL;
+                    last_error = NULL,
+                    verification_invite_dm_ok = TRUE;
                 """,
                 str(discord_user_id),
                 str(guild_id),
@@ -625,6 +712,8 @@ class Database:
                     is_verified = FALSE,
                     verification_locked = FALSE,
                     verified_at = NULL,
+                    verification_invite_dm_ok = FALSE,
+                    verification_invite_last_attempt_at = NULL,
                     last_seen_at = NOW()
                 WHERE discord_user_id = $1 AND verification_status = 'exempt';
                 """,
@@ -645,6 +734,8 @@ class Database:
                     removed_for_timeout = TRUE,
                     last_error = EXCLUDED.last_error,
                     status = 'NOT_VERIFIED',
+                    verification_invite_dm_ok = FALSE,
+                    verification_invite_last_attempt_at = NULL,
                     last_seen_at = NOW();
                 """,
                 str(discord_user_id),
@@ -668,6 +759,8 @@ class Database:
                     removed_for_timeout = FALSE,
                     access_revoked = FALSE,
                     status = 'NOT_VERIFIED',
+                    verification_invite_dm_ok = FALSE,
+                    verification_invite_last_attempt_at = NULL,
                     last_seen_at = NOW()
                 WHERE discord_user_id = $1;
                 """,
@@ -739,6 +832,8 @@ class Database:
                     last_error = NULL,
                     removed_for_timeout = FALSE,
                     status = 'NOT_VERIFIED',
+                    verification_invite_dm_ok = FALSE,
+                    verification_invite_last_attempt_at = NULL,
                     last_seen_at = NOW()
                 WHERE discord_user_id = $1;
                 """,
@@ -1130,70 +1225,120 @@ async def send_status_message(guild: discord.Guild, content: str) -> None:
             logger.warning("Could not send status message: %s", e)
 
 
+async def _send_verification_invite_fallback_channel(
+    member: discord.Member, *, notice_trigger: str
+) -> Optional[str]:
+    """
+    If DM fails (e.g. Forbidden), post @mention + Verify in #verify-yourself, else server system channel.
+    Returns channel name if posted, else None.
+    """
+    guild = member.guild
+    text = (
+        f"{member.mention}\n"
+        "We couldn't **DM** you — allow direct messages from this server (**Settings → Privacy & Safety**), "
+        "or tap **Verify now** below.\n\n"
+        + VERIFY_DM_BODY
+    )
+    verify_ch = get_channel_by_name(guild, VERIFY_CHANNEL_NAME)
+    for ch in (verify_ch, guild.system_channel):
+        if ch and isinstance(ch, discord.TextChannel):
+            try:
+                await ch.send(text, view=VerifyView())
+                logger.info(
+                    "Verification fallback posted in #%s for member %s (%s)",
+                    ch.name,
+                    member.id,
+                    notice_trigger,
+                )
+                return ch.name
+            except discord.HTTPException as exc:
+                logger.warning("Verification fallback: could not send to #%s: %s", ch.name, exc)
+    return None
+
+
 async def send_verification_required_notice(
     member: discord.Member, *, notice_trigger: str = "unspecified"
 ) -> None:
     """
-    Tell new gated members they must verify. Posts in the server first (not bot DMs):
-    1) #verify-yourself  2) server system channel  3) DM last resort.
-    Ensure the verify channel (or system channel) allows the Unverified role to *View Channel*
-    if members must read the notice there.
+    1) DM **Verify now** + email modal (preferred).
+    2) On DM failure (Forbidden / HTTP), @mention + same button in #verify-yourself or system channel.
 
-    notice_trigger: written to VERIFY_YOURSELF_TRIGGER_LOG when posted in #verify-yourself.
+    DB: `verification_invite_dm_ok` true iff DM succeeded; `verification_invite_last_attempt_at` always updated.
+    The 30-minute compliance loop calls this again when it strips managed roles — retries transient DM errors.
+    Forbidden DMs keep failing; public fallback covers that. `on_ready` sweeps users with dm_ok=false past cooldown.
+
+    notice_trigger: recorded in VERIFY_YOURSELF_TRIGGER_LOG JSONL on successful delivery.
     """
     if member_is_verification_exempt(member):
         return
-    guild = member.guild
-    verify_ch = get_channel_by_name(guild, VERIFY_CHANNEL_NAME)
-    if verify_ch and isinstance(verify_ch, discord.TextChannel):
-        where = f" Use the **Verify now** button in this channel."
-    else:
-        where = (
-            f" Open **#{VERIFY_CHANNEL_NAME}** (or wherever the verify panel is) and use **Verify now**."
-        )
 
-    body = (
-        "You need to verify yourself first to get channel access.\n"
-        + VERIFY_REQUIREMENTS_SHORT
-        + "\n"
-        + where
-    )
+    gid = member.guild.id
 
-    # 1) In-server: verify channel (public server message with ping + Verify now button)
-    if verify_ch and isinstance(verify_ch, discord.TextChannel):
-        try:
-            await verify_ch.send(f"{member.mention} {body}", view=VerifyView())
-            logger.info("Verification notice posted in #%s for member %s", VERIFY_CHANNEL_NAME, member.id)
-            log_verify_yourself_channel_notice(member, notice_trigger=notice_trigger)
-            return
-        except discord.HTTPException as exc:
-            logger.warning("Verification notice: could not send to #%s: %s", VERIFY_CHANNEL_NAME, exc)
-
-    # 2) Server system / welcome channel (Server Settings → Overview)
-    if guild.system_channel and isinstance(guild.system_channel, discord.TextChannel):
-        try:
-            await guild.system_channel.send(f"{member.mention} {body}", view=VerifyView())
-            logger.info("Verification notice posted in system channel for member %s", member.id)
-            return
-        except discord.HTTPException as exc:
-            logger.warning("Verification notice: system channel send failed: %s", exc)
-
-    # 3) Last resort: private DM from the bot
     try:
-        await member.send(
-            "You need to verify yourself first to get channel access.\n"
-            + VERIFY_REQUIREMENTS_SHORT
-            + f"\nUse **Verify now** in the **#{VERIFY_CHANNEL_NAME}** channel in the server."
+        await member.send(VERIFY_DM_BODY, view=VerifyView())
+        logger.info("Verification notice DM sent to member %s (%s)", member.id, notice_trigger)
+        await db.record_verification_invite_outcome(member.id, dm_ok=True, guild_id=gid)
+        log_verification_notice_sent(
+            member, notice_trigger=notice_trigger, delivery="dm"
         )
-        logger.info("Verification notice sent via DM to %s (no in-server channel worked)", member.id)
+        return
     except discord.Forbidden:
         logger.warning(
-            "Verification notice: no in-server delivery and cannot DM %s — check #%s / system channel / bot perms",
+            "Verification notice: cannot DM member %s — trying public channel fallback (Privacy & Safety → allow DMs).",
             member.id,
-            VERIFY_CHANNEL_NAME,
         )
     except discord.HTTPException as exc:
-        logger.warning("Verification notice: DM failed for %s: %s", member.id, exc)
+        logger.warning("Verification notice: DM failed for %s: %s — trying channel fallback", member.id, exc)
+
+    ch_name = await _send_verification_invite_fallback_channel(member, notice_trigger=notice_trigger)
+    await db.record_verification_invite_outcome(member.id, dm_ok=False, guild_id=gid)
+    if ch_name:
+        log_verification_notice_sent(
+            member,
+            notice_trigger=notice_trigger,
+            delivery="channel_fallback",
+            fallback_channel=ch_name,
+        )
+    else:
+        logger.error(
+            "Verification: DM and channel fallback both failed for member %s — user may need admin help.",
+            member.id,
+        )
+
+
+async def retry_verification_invites_after_reconnect(guild: discord.Guild) -> None:
+    """
+    After bot (re)connect, re-try DM for users who never got dm_ok (e.g. transient outage).
+    Cooldown from last attempt uses VERIFICATION_DM_RETRY_COOLDOWN_MINUTES to avoid spam with on_ready repeats.
+    """
+    lock = _verification_invite_retry_lock_get()
+    async with lock:
+        await asyncio.sleep(35)
+        try:
+            rows = await db.list_discord_user_ids_pending_invite_dm_retry(
+                str(guild.id), SETTINGS.verification_dm_retry_cooldown_minutes
+            )
+        except Exception:
+            logger.exception("verification invite DM retry: query failed")
+            return
+        for row in rows:
+            uid_str = row["discord_user_id"]
+            try:
+                uid = int(uid_str)
+            except (TypeError, ValueError):
+                continue
+            member = guild.get_member(uid)
+            if member is None or member.bot:
+                continue
+            if member_is_verification_exempt(member):
+                continue
+            rec = await db.get_user(uid)
+            if rec and rec.get("access_revoked"):
+                continue
+            if rec and member_db_verified(rec):
+                continue
+            await send_verification_required_notice(member, notice_trigger="on_ready_dm_retry")
+            await asyncio.sleep(0)
 
 
 async def apply_access_revoke_in_discord(
@@ -1233,6 +1378,38 @@ async def apply_access_revoke_in_discord(
 # ============================================================
 # Verification UI
 # ============================================================
+def _interaction_use_ephemeral(interaction: discord.Interaction) -> bool:
+    """Ephemeral responses are only valid in guild channels."""
+    return interaction.guild is not None
+
+
+async def _guild_and_member_for_verify(
+    interaction: discord.Interaction,
+) -> Tuple[Optional[discord.Guild], Optional[discord.Member], Optional[str]]:
+    """
+    Resolve target guild (GUILD_ID) and Member for role updates.
+    In DMs, interaction.user is User — fetch Member from the configured guild.
+    Returns (guild, member, user_error_message).
+    """
+    u = interaction.user
+    if interaction.guild is not None and isinstance(u, discord.Member):
+        return interaction.guild, u, None
+    g = bot.get_guild(SETTINGS.guild_id)
+    if g is None:
+        return None, None, "Bot cannot reach the server right now. Try again later or contact an admin."
+    m = g.get_member(u.id)
+    if m is None:
+        try:
+            m = await g.fetch_member(u.id)
+        except discord.NotFound:
+            return None, None, (
+                "You must **join the server** first. After joining, open this DM again and tap **Verify now**."
+            )
+        except discord.HTTPException:
+            return None, None, "Could not load your member profile. Try again in a moment."
+    return g, m, None
+
+
 class VerifyModal(discord.ui.Modal, title="Discord Access Verification"):
     email = discord.ui.TextInput(
         label="Deccan-associated mail address",
@@ -1242,37 +1419,41 @@ class VerifyModal(discord.ui.Modal, title="Discord Access Verification"):
     )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Guild context missing.", ephemeral=True)
+        guild, member, err = await _guild_and_member_for_verify(interaction)
+        ephem = _interaction_use_ephemeral(interaction)
+        if err:
+            await interaction.response.send_message(err, ephemeral=ephem)
             return
 
         # Defer immediately: DB + role work must not block the initial interaction (3s limit → 10062).
         try:
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephem)
         except discord.NotFound:
             logger.warning(
                 "Verify modal: interaction expired before defer (10062) — try again after heavy server load."
             )
             return
 
-        if member_is_verification_exempt(interaction.user):
+        assert guild is not None and member is not None
+
+        if member_is_verification_exempt(member):
             await interaction.followup.send(
                 "Your role does not require verification.",
-                ephemeral=True,
+                ephemeral=ephem,
             )
             return
 
-        record = await db.get_user(interaction.user.id)
+        record = await db.get_user(member.id)
         if record and record.get("access_revoked"):
             await interaction.followup.send(
                 "Your access is being revoked or was revoked. Wait a moment or contact an admin.",
-                ephemeral=True,
+                ephemeral=ephem,
             )
             return
         if record and member_db_verified(record):
             await interaction.followup.send(
                 "You are already verified (status is VERIFIED). No action needed.",
-                ephemeral=True,
+                ephemeral=ephem,
             )
             return
 
@@ -1280,25 +1461,25 @@ class VerifyModal(discord.ui.Modal, title="Discord Access Verification"):
 
         matched, row, message = await db.find_allocation_match(email=email)
         if not matched or not row:
-            await db.mark_failed_attempt(interaction.user.id, message)
-            await gate_member(interaction.user, "Verification failed")
+            await db.mark_failed_attempt(member.id, message)
+            await gate_member(member, "Verification failed")
             await interaction.followup.send(
                 f"Verification failed: {message}",
-                ephemeral=True,
+                ephemeral=ephem,
             )
             return
 
         try:
             tokens_logged, assigned_roles = await finalize_verified_member(
-                interaction.user,
+                member,
                 source_row=row,
                 typed_email=email,
             )
         except Exception:
-            logger.exception("finalize_verified_member failed for user %s", interaction.user.id)
+            logger.exception("finalize_verified_member failed for user %s", member.id)
             await interaction.followup.send(
                 "Verification could not complete due to a server error. Please try again or contact an admin.",
-                ephemeral=True,
+                ephemeral=ephem,
             )
             return
 
@@ -1306,15 +1487,15 @@ class VerifyModal(discord.ui.Modal, title="Discord Access Verification"):
         role_text = ", ".join(assigned_roles) if assigned_roles else "No matching managed access roles on server (check allocations.projects, MANAGED_ACCESS_ROLE_NAMES, aliases, and Discord role names)"
         await interaction.followup.send(
             f"Verification successful.\n"
-            f"Discord user ID (stored): `{interaction.user.id}`\n"
+            f"Discord user ID (stored): `{member.id}`\n"
             f"Role tokens (from allocations.projects): {token_text}\n"
             f"Roles assigned on server: {role_text}",
-            ephemeral=True,
+            ephemeral=ephem,
         )
         canon = str(row.get("email") or "").strip()
         await send_status_message(
-            interaction.guild,
-            f"✅ Verified: {interaction.user.mention} | allocation_email={canon} | roles: {role_text}",
+            guild,
+            f"✅ Verified: {member.mention} | allocation_email={canon} | roles: {role_text}",
         )
 
 
@@ -1324,14 +1505,17 @@ class VerifyView(discord.ui.View):
 
     @discord.ui.button(label="Verify now", style=discord.ButtonStyle.success, custom_id="verify_now_button")
     async def verify_now(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Guild context missing.", ephemeral=True)
+        ephem = _interaction_use_ephemeral(interaction)
+        _guild, member, err = await _guild_and_member_for_verify(interaction)
+        if err:
+            await interaction.response.send_message(err, ephemeral=ephem)
             return
+        assert member is not None
 
-        if member_is_verification_exempt(interaction.user):
+        if member_is_verification_exempt(member):
             await interaction.response.send_message(
                 "Your role does not require verification.",
-                ephemeral=True,
+                ephemeral=ephem,
             )
             return
 
@@ -1346,89 +1530,18 @@ class VerifyView(discord.ui.View):
 
 
 async def ensure_verify_panel_in_channel(guild: discord.Guild) -> None:
-    """Post a single Verify panel in #verify-yourself if the bot has not already done so."""
-    ch = get_channel_by_name(guild, VERIFY_CHANNEL_NAME)
-    if not ch or not isinstance(ch, discord.TextChannel):
-        logger.warning("Verify panel: channel #%s not found", VERIFY_CHANNEL_NAME)
-        return
-    try:
-        async for msg in ch.history(limit=40):
-            if msg.author == guild.me and msg.components:
-                for row in msg.components:
-                    for comp in row.children:
-                        if getattr(comp, "custom_id", None) == "verify_now_button":
-                            logger.info("Verify panel already in #%s (msg %s)", VERIFY_CHANNEL_NAME, msg.id)
-                            return
-    except discord.HTTPException as exc:
-        logger.warning("Verify panel: cannot read #%s history: %s", VERIFY_CHANNEL_NAME, exc)
-        return
-
-    try:
-        await ch.send(
-            VERIFY_PANEL_BODY,
-            view=VerifyView(),
-        )
-        logger.info("Posted Verify panel in #%s", VERIFY_CHANNEL_NAME)
-    except discord.HTTPException as exc:
-        logger.warning("Verify panel: could not post in #%s: %s", VERIFY_CHANNEL_NAME, exc)
+    """
+    (Disabled) Was: post a Verify panel in #verify-yourself. Invites are sent by DM only; re-enable by restoring
+    the implementation from git history if you want an in-server panel again.
+    """
+    return
 
 
 async def ensure_verify_channel_permissions(guild: discord.Guild) -> None:
     """
-    Restrict #verify-yourself so @everyone cannot view; allow Unverified + bot only.
-    Staff without Unverified then cannot read verify pings/panel (configure VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED=false to skip).
-    Requires bot: Manage Channels; bot role should be above @everyone for overwrites to apply reliably.
+    (Disabled) Was: auto-set #verify-yourself overwrites. Configure that channel manually if you still use it.
     """
-    if not SETTINGS.restrict_verify_channel_to_unverified:
-        return
-    ch = get_channel_by_name(guild, VERIFY_CHANNEL_NAME)
-    if not ch or not isinstance(ch, discord.TextChannel):
-        logger.warning("Verify channel permissions: #%s not found", VERIFY_CHANNEL_NAME)
-        return
-    me = guild.me
-    if not me:
-        return
-    unverified = get_role(guild, SETTINGS.unverified_role_name)
-    if not unverified:
-        logger.warning(
-            "Verify channel permissions: role %r missing — create it or disable auto-restrict",
-            SETTINGS.unverified_role_name,
-        )
-        return
-    try:
-        await ch.set_permissions(
-            guild.default_role,
-            view_channel=False,
-            reason="Verify-yourself: only Unverified + bot should see this channel",
-        )
-        await ch.set_permissions(
-            unverified,
-            view_channel=True,
-            read_message_history=True,
-            reason="Members who must verify can read this channel",
-        )
-        await ch.set_permissions(
-            me,
-            view_channel=True,
-            send_messages=True,
-            embed_links=True,
-            attach_files=True,
-            read_message_history=True,
-            manage_messages=True,
-            reason="Bot verify panel and notices",
-        )
-        logger.info(
-            "Set #%s: deny view @everyone; allow %s + bot",
-            VERIFY_CHANNEL_NAME,
-            SETTINGS.unverified_role_name,
-        )
-    except discord.Forbidden:
-        logger.warning(
-            "Could not set #%s permissions — bot needs Manage Channels (and sufficient role position)",
-            VERIFY_CHANNEL_NAME,
-        )
-    except discord.HTTPException as exc:
-        logger.warning("Verify channel permission update failed: %s", exc)
+    return
 
 
 # ============================================================
@@ -1443,8 +1556,9 @@ async def on_ready() -> None:
         return
 
     await ensure_roles_exist(guild)
-    await ensure_verify_channel_permissions(guild)
-    await ensure_verify_panel_in_channel(guild)
+    # DM-only verification: no auto #verify-yourself panel or permission edits (see ensure_* stubs).
+    # await ensure_verify_channel_permissions(guild)
+    # await ensure_verify_panel_in_channel(guild)
 
     if not timeout_cleanup_loop.is_running():
         timeout_cleanup_loop.start()
@@ -1457,6 +1571,8 @@ async def on_ready() -> None:
 
     if SETTINGS.audit_on_startup:
         asyncio.create_task(run_full_verification_compliance_audit(guild, initial_delay=True))
+
+    asyncio.create_task(retry_verification_invites_after_reconnect(guild))
 
     logger.info("Bot is ready")
 
@@ -1523,7 +1639,7 @@ async def run_full_verification_compliance_audit(
 ) -> None:
     """
     Every human member: match Discord to DB.
-    Not verified (or no record) → strip managed access roles, gate; if they had access roles, ping verify-yourself.
+    Not verified (or no record) → strip managed access roles, gate; if they had access roles, DM verify invite.
     announce: if False, status channel is only notified when someone was revoked or stripped+notified (less spam).
     initial_delay: brief pause before first audit (startup only).
     """
@@ -1581,7 +1697,7 @@ async def sync_verification_roles_for_scoped_audit(
     Scoped audit (members with any managed access role): same verify-first rules.
     - access_revoked → hard revoke
     - verified in DB → clear gate only
-    - else → strip managed access roles, gate, notify if they had access
+    - else → strip managed access roles, gate, DM verify invite if they had access
     """
     if record and record.get("access_revoked"):
         await revoke_member_access(member, reason)
@@ -1732,7 +1848,7 @@ async def helpme_command(ctx: commands.Context) -> None:
         "**Verify first:** managed access roles (see `MANAGED_ACCESS_ROLE_NAMES` in bot_verifier.py) are removed until you complete verification. After verify, roles follow **`allocations.projects`** for your allocation (whitelist + optional aliases in code).\n"
         + VERIFY_REQUIREMENTS_SHORT
         + "\n"
-        "Use **Verify now** below (or in **#verify-yourself**).\n"
+        "Use **Verify now** below in this channel, or check your **DMs from this bot** if you were prompted there.\n"
         "DB **status** = VERIFIED | NOT_VERIFIED (no Discord Verified role). Deny **Unverified** on gated categories.\n"
         "`!reset_verification` — strips managed access roles and resets DB; you must verify again. Admins: `!reset_verification @user`.\n"
         "`!revoke_access @user` — admin: revoke + gate.\n"
