@@ -370,9 +370,22 @@ _PROJECT_SEP_RE = re.compile(r"[,;/|]+")
 
 
 def split_projects_str(projects: Any) -> List[str]:
-    """Split `allocations.projects` text on comma, semicolon, slash, or pipe; trim whitespace; drop empties."""
+    """Split `allocations.projects` into role tokens.
+
+    - **TEXT** column: split on comma, semicolon, slash, or pipe; trim; drop empties.
+    - **PostgreSQL ARRAY** (e.g. ``text[]``): asyncpg returns a Python ``list`` — one token per element (no ``str(list)``).
+    """
     if projects is None:
         return []
+    if isinstance(projects, (list, tuple)):
+        out: List[str] = []
+        for p in projects:
+            if p is None:
+                continue
+            t = str(p).strip()
+            if t:
+                out.append(t)
+        return out
     s = str(projects).strip()
     if not s:
         return []
