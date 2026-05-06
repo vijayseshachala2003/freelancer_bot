@@ -2424,6 +2424,7 @@ def _panel_embed() -> discord.Embed:
         name="🔍 Visibility & Config",
         value=(
             "👁️ **View Members by Role** — List all verified users under a role\n"
+            "🔎 **User Status** — Check a user's DB record, verification state & allocation\n"
             "⚙️ **Role Config** — View / edit managed and exempt role lists"
         ),
         inline=False,
@@ -3465,6 +3466,154 @@ class ViewRolesConfigView(discord.ui.View):
         await interaction.response.send_modal(ManageExemptRolesModal())
 
 
+# ── User Status ───────────────────────────────────────────────────────────────
+
+class UserStatusModal(discord.ui.Modal, title="User Status Lookup"):
+    user_input = discord.ui.TextInput(
+        label="Email address or Discord username / user ID",
+        placeholder="user@example.com  or  johndoe  or  123456789012345678",
+        required=True,
+        max_length=200,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild or bot.get_guild(SETTINGS.guild_id)
+        if not guild:
+            await interaction.followup.send("Guild not found.", ephemeral=True)
+            return
+
+        query = self.user_input.value.strip()
+        member: Optional[discord.Member] = None
+        discord_id: Optional[int] = None
+        duv_rec: Optional[asyncpg.Record] = None
+        alloc_rec: Optional[asyncpg.Record] = None
+
+        if "@" in query:
+            # ── Email path ──
+            email_query = query.lower()
+            alloc_rec = await db.fetch_allocation_by_email(email_query)
+            assert db.pool is not None
+            async with db.pool.acquire() as conn:
+                duv_rec = await conn.fetchrow(
+                    "SELECT * FROM discord_user_verification WHERE email = $1", email_query
+                )
+            if duv_rec:
+                try:
+                    discord_id = int(duv_rec["discord_user_id"])
+                    member = guild.get_member(discord_id) or await guild.fetch_member(discord_id)
+                except (TypeError, ValueError, discord.NotFound):
+                    pass
+        else:
+            # ── Discord username / ID path ──
+            member = await _resolve_member_by_query(guild, query)
+            if member is None and query.isdigit():
+                discord_id = int(query)
+            elif member:
+                discord_id = member.id
+
+            if discord_id:
+                duv_rec = await db.get_user(discord_id)
+
+            if duv_rec:
+                linked_email = (duv_rec.get("email") or "").strip()
+                if linked_email:
+                    alloc_rec = await db.fetch_allocation_by_email(linked_email)
+
+        # ── Build embed ──
+        if member:
+            title = f"{member.display_name} ({member})"
+            colour = discord.Colour.green() if duv_rec else discord.Colour.orange()
+        else:
+            title = f"User ID {discord_id}" if discord_id else f'"{query}"'
+            colour = discord.Colour.red()
+
+        embed = discord.Embed(title=title, colour=colour)
+
+        # Discord presence (if member is in guild)
+        if member:
+            embed.set_thumbnail(url=member.display_avatar.url)
+            embed.add_field(name="Discord ID", value=str(member.id), inline=True)
+            embed.add_field(name="Joined Server", value=f"<t:{int(member.joined_at.timestamp())}:R>" if member.joined_at else "Unknown", inline=True)
+            managed_roles = [r.name for r in member.roles if r.name in SETTINGS.managed_access_role_names]
+            embed.add_field(
+                name="Current Managed Roles",
+                value=", ".join(managed_roles) if managed_roles else "None",
+                inline=False,
+            )
+        else:
+            embed.add_field(name="Discord Status", value="⚠️ Not in server", inline=False)
+
+        # DB record
+        if duv_rec:
+            status = duv_rec.get("status") or "UNKNOWN"
+            verified = duv_rec.get("is_verified") or False
+            v_status = duv_rec.get("verification_status") or "—"
+            email = (duv_rec.get("email") or "").strip() or "—"
+            last_seen = duv_rec.get("last_seen_at")
+            access_revoked = duv_rec.get("access_revoked") or False
+            assigned_roles_json = duv_rec.get("assigned_roles") or []
+            assigned_roles_list = assigned_roles_json if isinstance(assigned_roles_json, list) else []
+
+            status_icon = "✅" if verified else "❌"
+            embed.add_field(
+                name="Verification",
+                value=(
+                    f"{status_icon} **{status}** (`{v_status}`)\n"
+                    f"Email: `{email}`\n"
+                    f"Last seen: {f'<t:{int(last_seen.timestamp())}:R>' if last_seen else '—'}\n"
+                    f"Access revoked: {'Yes ⚠️' if access_revoked else 'No'}"
+                ),
+                inline=False,
+            )
+            if assigned_roles_list:
+                embed.add_field(
+                    name="DB Assigned Roles",
+                    value=", ".join(str(r) for r in assigned_roles_list) or "—",
+                    inline=False,
+                )
+        else:
+            embed.add_field(
+                name="Database",
+                value="❌ No record in `discord_user_verification`",
+                inline=False,
+            )
+
+        # Allocation record
+        if alloc_rec:
+            alloc_active = alloc_rec.get("active")
+            alloc_status = alloc_rec.get("status") or "—"
+            alloc_projects = alloc_rec.get("projects") or "—"
+            alloc_updated = alloc_rec.get("updated_at")
+            active_icon = "✅" if alloc_active else "🔴"
+            embed.add_field(
+                name="Allocation",
+                value=(
+                    f"{active_icon} Active: `{alloc_active}` · Status: `{alloc_status}`\n"
+                    f"Projects: `{alloc_projects}`\n"
+                    f"Updated: {f'<t:{int(alloc_updated.timestamp())}:R>' if alloc_updated else '—'}"
+                ),
+                inline=False,
+            )
+        elif duv_rec and (duv_rec.get("email") or "").strip():
+            embed.add_field(
+                name="Allocation",
+                value=f"⚠️ No allocation row for `{duv_rec.get('email')}`",
+                inline=False,
+            )
+        else:
+            embed.add_field(name="Allocation", value="— Not linked", inline=False)
+
+        if not member and not duv_rec:
+            embed.description = "No Discord member or database record found for that query."
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 # ── Main AdminPanelView ───────────────────────────────────────────────────────
 
 class AdminPanelView(discord.ui.View):
@@ -3600,6 +3749,20 @@ class AdminPanelView(discord.ui.View):
             await interaction.response.send_message("Access denied.", ephemeral=True)
             return
         await interaction.response.send_modal(BulkServerRemoveModal())
+
+    @discord.ui.button(
+        label="User Status",
+        style=discord.ButtonStyle.primary,
+        custom_id="admin_user_status",
+        row=4,
+    )
+    async def user_status(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_modal(UserStatusModal())
 
     @discord.ui.button(
         label="Role Config",
