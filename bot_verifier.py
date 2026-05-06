@@ -232,8 +232,8 @@ class Settings:
     verification_timeout_hours: int = 24
     audit_on_startup: bool = True
     status_channel_name: Optional[str] = None
-    managed_access_role_names: frozenset[str] = field(default_factory=frozenset)
-    verification_exempt_role_names: frozenset[str] = field(default_factory=frozenset)
+    managed_access_role_names: set[str] = field(default_factory=set)
+    verification_exempt_role_names: set[str] = field(default_factory=set)
     restrict_verify_channel_to_unverified: bool = True
     verification_dm_retry_cooldown_minutes: int = 20
 
@@ -283,7 +283,7 @@ def get_settings() -> Settings:
     if not database_url:
         missing.append("DATABASE_URL or (SUPABASE_DB_HOST + SUPABASE_DB_PASSWORD)")
 
-    managed = frozenset(MANAGED_ACCESS_ROLE_NAMES)
+    managed = set(MANAGED_ACCESS_ROLE_NAMES)
     if not managed:
         raise RuntimeError(
             "MANAGED_ACCESS_ROLE_NAMES in bot_verifier.py must contain at least one Discord role name."
@@ -305,7 +305,7 @@ def get_settings() -> Settings:
         audit_on_startup=os.getenv("AUDIT_ON_STARTUP", "true").lower() == "true",
         status_channel_name=os.getenv("STATUS_CHANNEL_NAME"),
         managed_access_role_names=managed,
-        verification_exempt_role_names=frozenset(VERIFICATION_EXEMPT_ROLE_NAMES),
+        verification_exempt_role_names=set(VERIFICATION_EXEMPT_ROLE_NAMES),
         restrict_verify_channel_to_unverified=os.getenv(
             "VERIFY_CHANNEL_RESTRICT_TO_UNVERIFIED", "true"
         ).lower()
@@ -324,6 +324,8 @@ def get_settings() -> Settings:
 SETTINGS = get_settings()
 
 PORT = int(os.getenv("PORT", "8080"))
+ADMIN_PANEL_CHANNEL_NAME = os.getenv("ADMIN_PANEL_CHANNEL_NAME", "admin-management")
+SUPPORT_ROLE_NAME = os.getenv("SUPPORT_ROLE_NAME", "Support")
 
 # One reconnect/retry sweep at a time (on_ready may fire multiple times).
 _verification_invite_retry_lock: Optional[asyncio.Lock] = None
@@ -367,6 +369,20 @@ def allocation_row_can_verify(row: Dict[str, Any]) -> bool:
 
 
 _PROJECT_SEP_RE = re.compile(r"[,;/|]+")
+
+# Detected at DB connect time; None until connect() runs.
+_PROJECTS_COL_IS_ARRAY: Optional[bool] = None
+
+
+def _projects_to_db(tokens: List[str]) -> Any:
+    """Return the correct value to pass to asyncpg for allocations.projects.
+
+    asyncpg maps Python list → PostgreSQL TEXT[]; TEXT columns want a plain string.
+    Detected once at startup from information_schema.
+    """
+    if _PROJECTS_COL_IS_ARRAY:
+        return tokens
+    return ",".join(tokens)
 
 
 def split_projects_str(projects: Any) -> List[str]:
@@ -416,7 +432,32 @@ class Database:
             self.dsn, min_size=1, max_size=5, statement_cache_size=0
         )
         await self.init_schema()
+        await self._detect_projects_col_type()
         logger.info("Connected to database")
+
+    async def _detect_projects_col_type(self) -> None:
+        """Detect whether allocations.projects is TEXT or TEXT[] and cache the result."""
+        global _PROJECTS_COL_IS_ARRAY
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name   = 'allocations'
+                  AND column_name  = 'projects'
+                """
+            )
+        if row:
+            _PROJECTS_COL_IS_ARRAY = row["data_type"].upper() in ("ARRAY",)
+        else:
+            _PROJECTS_COL_IS_ARRAY = False
+        logger.info(
+            "allocations.projects column type: %s (is_array=%s)",
+            row["data_type"] if row else "unknown",
+            _PROJECTS_COL_IS_ARRAY,
+        )
 
     async def init_schema(self) -> None:
         assert self.pool is not None
@@ -510,6 +551,53 @@ class Database:
 
                 DROP INDEX IF EXISTS idx_allocations_discord_email;
                 ALTER TABLE allocations DROP COLUMN IF EXISTS discord_email;
+                """
+            )
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS admin_audit_log (
+                    id               BIGSERIAL PRIMARY KEY,
+                    actor_discord_id TEXT NOT NULL,
+                    actor_username   TEXT NOT NULL,
+                    action           TEXT NOT NULL,
+                    target_email     TEXT,
+                    target_discord_id TEXT,
+                    details          JSONB,
+                    performed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_aal_performed_at
+                    ON admin_audit_log (performed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_aal_actor
+                    ON admin_audit_log (actor_discord_id);
+                """
+            )
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_removal (
+                    id               BIGSERIAL PRIMARY KEY,
+                    discord_user_id  TEXT,
+                    email            TEXT,
+                    discord_username TEXT,
+                    reason           TEXT,
+                    removed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    removed_by       TEXT NOT NULL DEFAULT 'system'
+                );
+                CREATE INDEX IF NOT EXISTS idx_user_removal_discord_user_id
+                    ON user_removal (discord_user_id);
+                CREATE INDEX IF NOT EXISTS idx_user_removal_email
+                    ON user_removal (email);
                 """
             )
 
@@ -925,6 +1013,120 @@ class Database:
             return False, row, "This allocation is revoked or banned."
         return True, row, "matched"
 
+    async def get_setting(self, key: str) -> Optional[str]:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT value FROM bot_settings WHERE key = $1", key
+            )
+        return row["value"] if row else None
+
+    async def set_setting(self, key: str, value: str) -> None:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO bot_settings (key, value, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                """,
+                key,
+                value,
+            )
+
+    async def log_admin_action(
+        self,
+        actor: discord.Member,
+        action: str,
+        *,
+        target_email: Optional[str] = None,
+        target_discord_id: Optional[int] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO admin_audit_log
+                    (actor_discord_id, actor_username, action,
+                     target_email, target_discord_id, details)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                """,
+                str(actor.id),
+                str(actor),
+                action,
+                target_email,
+                str(target_discord_id) if target_discord_id is not None else None,
+                json.dumps(details) if details is not None else None,
+            )
+
+    async def insert_user_removal(
+        self,
+        discord_user_id: Optional[int],
+        email: Optional[str],
+        discord_username: Optional[str],
+        reason: str,
+        removed_by: str = "system",
+    ) -> None:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO user_removal
+                    (discord_user_id, email, discord_username, reason, removed_by)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                str(discord_user_id) if discord_user_id is not None else None,
+                email,
+                discord_username,
+                reason,
+                removed_by,
+            )
+
+    async def load_role_config(self) -> None:
+        """Load managed/exempt role lists from bot_settings; mutates SETTINGS in place. Falls back to hardcoded defaults."""
+        for key, target_set, default_tuple in [
+            ("managed_access_roles", SETTINGS.managed_access_role_names, MANAGED_ACCESS_ROLE_NAMES),
+            ("verification_exempt_roles", SETTINGS.verification_exempt_role_names, VERIFICATION_EXEMPT_ROLE_NAMES),
+        ]:
+            val = await self.get_setting(key)
+            if val:
+                try:
+                    loaded = json.loads(val)
+                    if isinstance(loaded, list) and all(isinstance(x, str) for x in loaded):
+                        target_set.clear()
+                        target_set.update(loaded)
+                        logger.info("Role config: loaded '%s' from DB: %s", key, loaded)
+                        continue
+                except json.JSONDecodeError:
+                    logger.warning("bot_settings key '%s' has invalid JSON — using hardcoded default", key)
+            target_set.clear()
+            target_set.update(default_tuple)
+
+        aliases_val = await self.get_setting("project_role_aliases")
+        if aliases_val:
+            try:
+                loaded_aliases = json.loads(aliases_val)
+                if isinstance(loaded_aliases, dict):
+                    PROJECT_ROLE_ALIASES.clear()
+                    PROJECT_ROLE_ALIASES.update(loaded_aliases)
+                    logger.info("Role config: loaded project_role_aliases from DB")
+            except json.JSONDecodeError:
+                logger.warning("bot_settings key 'project_role_aliases' has invalid JSON — using hardcoded default")
+
+    async def save_role_config(
+        self,
+        managed: Optional[List[str]] = None,
+        exempt: Optional[List[str]] = None,
+        aliases: Optional[Dict[str, str]] = None,
+    ) -> None:
+        if managed is not None:
+            await self.set_setting("managed_access_roles", json.dumps(sorted(managed)))
+        if exempt is not None:
+            await self.set_setting("verification_exempt_roles", json.dumps(sorted(exempt)))
+        if aliases is not None:
+            await self.set_setting("project_role_aliases", json.dumps(aliases))
+
 
 # ============================================================
 # Discord bot
@@ -1190,6 +1392,56 @@ async def gate_member(member: discord.Member, reason: str) -> None:
     """Add Unverified; remove legacy Verified role. Does not remove managed access roles (use revoke_member_access for verify-first)."""
     await assign_role_if_missing(member, SETTINGS.unverified_role_name, reason)
     await remove_role_if_present(member, SETTINGS.verified_role_name, reason)
+
+
+async def _resolve_member_by_query(guild: discord.Guild, query: str) -> Optional[discord.Member]:
+    """Resolve a username, display name, or numeric ID string to a guild Member."""
+    query = query.strip()
+    if not query:
+        return None
+    if query.isdigit():
+        member = guild.get_member(int(query))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(query))
+            except discord.NotFound:
+                pass
+        if member:
+            return member
+    q = query.lower()
+    for m in guild.members:
+        if m.bot:
+            continue
+        if m.name.lower() == q or m.display_name.lower() == q:
+            return m
+    for m in guild.members:
+        if m.bot:
+            continue
+        if q in m.name.lower() or q in m.display_name.lower():
+            return m
+    return None
+
+
+async def _strip_inactive_allocation_member(
+    member: discord.Member,
+    email: str,
+    reason: str,
+    removed_by: str = "system",
+) -> bool:
+    """Strip all managed access roles from a member whose allocation.active=False. Returns True if any roles were removed."""
+    removed = await remove_all_access_roles(member)
+    if not removed:
+        return False
+    await db.apply_revoke_completed(member.id)
+    await db.insert_user_removal(
+        discord_user_id=member.id,
+        email=email,
+        discord_username=str(member),
+        reason=reason,
+        removed_by=removed_by,
+    )
+    logger.info("Stripped inactive-allocation member %s (email=%s)", member.id, email)
+    return True
 
 
 async def revoke_member_access(member: discord.Member, reason: str) -> None:
@@ -1592,9 +1844,11 @@ async def on_ready() -> None:
 @bot.event
 async def setup_hook() -> None:
     await db.connect()
+    await db.load_role_config()
     logger.info("Allocation data is read from PostgreSQL table `allocations`.")
     # Persistent views: register once per process (on_ready can run again on reconnect).
     bot.add_view(VerifyView())
+    bot.add_view(AdminPanelView())
 
 
 @bot.event
@@ -1778,6 +2032,52 @@ async def before_timeout_cleanup_loop() -> None:
     await bot.wait_until_ready()
 
 
+async def inactive_allocation_sweep(guild: discord.Guild) -> None:
+    """Strip managed roles from verified members whose allocation.active=False and log to user_removal."""
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT duv.discord_user_id, duv.email, duv.discord_username
+            FROM discord_user_verification duv
+            JOIN allocations a ON a.email = duv.email
+            WHERE duv.guild_id = $1
+              AND duv.status = 'VERIFIED'
+              AND a.active = FALSE
+            """,
+            str(SETTINGS.guild_id),
+        )
+    for row in rows:
+        try:
+            uid = int(row["discord_user_id"])
+        except (TypeError, ValueError):
+            continue
+        member = guild.get_member(uid)
+        if member is None:
+            try:
+                member = await guild.fetch_member(uid)
+            except discord.NotFound:
+                await db.insert_user_removal(
+                    discord_user_id=uid,
+                    email=row["email"],
+                    discord_username=row["discord_username"],
+                    reason="allocation.active=False (member not in guild)",
+                    removed_by="system",
+                )
+                await db.apply_revoke_completed(uid)
+                continue
+            except Exception as exc:
+                logger.warning("inactive_allocation_sweep: fetch %s failed: %s", uid, exc)
+                continue
+        await _strip_inactive_allocation_member(
+            member,
+            email=row["email"] or "",
+            reason="allocation.active=False (compliance sweep)",
+            removed_by="system",
+        )
+        await asyncio.sleep(0)
+
+
 @tasks.loop(minutes=30)
 async def verification_compliance_loop() -> None:
     """Re-run full verify-first compliance pass every 30 minutes."""
@@ -1785,6 +2085,7 @@ async def verification_compliance_loop() -> None:
     if not guild:
         return
     await run_full_verification_compliance_audit(guild, announce=False, initial_delay=False)
+    await inactive_allocation_sweep(guild)
 
 
 @verification_compliance_loop.before_loop
@@ -1940,6 +2241,12 @@ async def revoke_access_command(ctx: commands.Context, member: Optional[discord.
         f"Admin revoke by {ctx.author}",
     )
     if ok:
+        await db.log_admin_action(
+            ctx.author,
+            "revoke_access",
+            target_discord_id=member.id,
+            details={"reason": f"Admin revoke by {ctx.author}"},
+        )
         await send_verification_required_notice(member, notice_trigger="revoke_access")
         await ctx.reply(
             f"Access revoked for {member.mention}. They can use **Verify** again after re-approval.",
@@ -1996,6 +2303,13 @@ async def kick_command(ctx: commands.Context, member: Optional[discord.Member] =
     else:
         alloc_note = " No allocation `email` in `discord_user_verification` — allocation row not updated."
 
+    await db.log_admin_action(
+        ctx.author,
+        "kick",
+        target_discord_id=member.id,
+        target_email=alloc_email or None,
+        details={"reason": kick_reason, "alloc_note": alloc_note.strip()},
+    )
     logger.info("Kick: %s by %s (%s)", member.id, ctx.author.id, kick_reason)
     await ctx.reply(f"Kicked **{member}** ({kick_reason}).{alloc_note}")
 
@@ -2046,8 +2360,1314 @@ async def ban_command(ctx: commands.Context, member: Optional[discord.Member] = 
     else:
         alloc_note = " No allocation `email` in `discord_user_verification` — allocation row not updated."
 
+    await db.log_admin_action(
+        ctx.author,
+        "ban",
+        target_discord_id=uid,
+        target_email=alloc_email or None,
+        details={"reason": ban_reason, "alloc_note": alloc_note.strip()},
+    )
     logger.info("Ban: %s by %s (%s)", uid, ctx.author.id, ban_reason)
     await ctx.reply(f"Banned **{member}** ({ban_reason}).{alloc_note}")
+
+
+# ============================================================
+# Admin Management Panel
+# ============================================================
+
+async def _load_admin_panel_id() -> Optional[int]:
+    try:
+        val = await db.get_setting("admin_panel_message_id")
+        return int(val) if val else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _save_admin_panel_id(message_id: int) -> None:
+    await db.set_setting("admin_panel_message_id", str(message_id))
+
+
+def _is_panel_authorized(interaction: discord.Interaction) -> bool:
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    allowed = {SETTINGS.admin_role_name, SUPPORT_ROLE_NAME}
+    return any(r.name in allowed for r in interaction.user.roles)
+
+
+def _panel_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="🛠️ Admin Management Panel",
+        colour=discord.Colour.blurple(),
+        timestamp=datetime.now(UTC),
+    )
+    embed.add_field(
+        name="👤 User Management",
+        value=(
+            "➕ **Add User to Role** — Add email + role to allocations\n"
+            "➖ **Remove User from Role** — Remove a role token from an allocation\n"
+            "🔄 **Reset / Re-verify User** — Force a user to re-verify\n"
+            "✏️ **Edit Allocation** — Update projects / active / status"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📦 Bulk Operations",
+        value=(
+            "📋 **Bulk Add Users** — Add multiple users at once (paste or CSV)\n"
+            "✅ **Bulk Assign Role** — Add a managed role to multiple users\n"
+            "🗑️ **Bulk Remove Role** — Strip a managed role from multiple users\n"
+            "🚫 **Bulk Server Remove** — Kick multiple users from the server"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔍 Visibility & Config",
+        value=(
+            "👁️ **View Members by Role** — List all verified users under a role\n"
+            "⚙️ **Role Config** — View / edit managed and exempt role lists"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"Responses are private · Access: {SETTINGS.admin_role_name} & {SUPPORT_ROLE_NAME}")
+    return embed
+
+
+# ── Add User ──────────────────────────────────────────────────────────────────
+
+class AddUserModal(discord.ui.Modal, title="Add User to Role"):
+    email = discord.ui.TextInput(
+        label="Email address",
+        placeholder="user@example.com",
+        required=True,
+        max_length=200,
+    )
+    projects = discord.ui.TextInput(
+        label="Role tokens (comma-separated)",
+        placeholder="BB_Access,maitrix-coders",
+        required=True,
+        max_length=500,
+    )
+    full_name = discord.ui.TextInput(
+        label="Full name (optional)",
+        required=False,
+        max_length=200,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        email_val = self.email.value.strip().lower()
+        projects_val = self.projects.value.strip()
+        full_name_val = (self.full_name.value or "").strip() or None
+
+        tokens = [t.strip() for t in re.split(r"[,;|/]+", projects_val) if t.strip()]
+        invalid = [t for t in tokens if t not in SETTINGS.managed_access_role_names]
+        if invalid:
+            valid_list = ", ".join(sorted(SETTINGS.managed_access_role_names))
+            await interaction.followup.send(
+                f"Invalid role tokens: **{', '.join(invalid)}**\nValid: `{valid_list}`",
+                ephemeral=True,
+            )
+            return
+
+        projects_str = ",".join(tokens)
+        assert db.pool is not None
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO allocations (email, full_name, projects, active, status, updated_at)
+                VALUES ($1, $2, $3, TRUE, 'ACTIVE', NOW())
+                ON CONFLICT (email) DO UPDATE SET
+                    full_name = COALESCE(EXCLUDED.full_name, allocations.full_name),
+                    projects = EXCLUDED.projects,
+                    active = TRUE,
+                    status = 'ACTIVE',
+                    updated_at = NOW()
+                """,
+                email_val, full_name_val, _projects_to_db(tokens),
+            )
+
+        guild = interaction.guild or bot.get_guild(SETTINGS.guild_id)
+        assigned_note = ""
+        if guild:
+            assert db.pool is not None
+            async with db.pool.acquire() as conn:
+                rec = await conn.fetchrow(
+                    "SELECT discord_user_id FROM discord_user_verification WHERE email = $1 AND status = 'VERIFIED'",
+                    email_val,
+                )
+            if rec:
+                uid = int(rec["discord_user_id"])
+                try:
+                    member = guild.get_member(uid) or await guild.fetch_member(uid)
+                    if member:
+                        alloc = await db.fetch_allocation_by_email(email_val)
+                        if alloc:
+                            t_list = get_managed_role_tokens_for_verified_allocation(alloc)
+                            allowed = allowed_managed_access_names_from_tokens(guild, t_list)
+                            assigned = await sync_managed_access_roles(
+                                member, allowed, "Admin panel: add user"
+                            )
+                            assigned_note = f"\nRoles applied to {member.mention}: `{', '.join(assigned) or 'none'}`."
+                except discord.NotFound:
+                    pass
+
+        if isinstance(interaction.user, discord.Member):
+            await db.log_admin_action(
+                interaction.user,
+                "add_user_to_role",
+                target_email=email_val,
+                details={"projects": projects_str, "roles_assigned": assigned_note.strip() or "none"},
+            )
+
+        await interaction.followup.send(
+            f"Allocation saved: **{email_val}** → `{projects_str}`.{assigned_note}",
+            ephemeral=True,
+        )
+
+
+# ── Remove User from Role ─────────────────────────────────────────────────────
+
+class RemoveRoleEmailModal(discord.ui.Modal, title="Remove User from Role"):
+    email = discord.ui.TextInput(
+        label="Email address",
+        placeholder="user@example.com",
+        required=True,
+        max_length=200,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        email_val = self.email.value.strip().lower()
+        alloc = await db.fetch_allocation_by_email(email_val)
+        if not alloc:
+            await interaction.followup.send(f"No allocation found for `{email_val}`.", ephemeral=True)
+            return
+        tokens = split_projects_str(alloc.get("projects"))
+        if not tokens:
+            await interaction.followup.send(
+                f"No roles currently assigned to `{email_val}`.", ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            f"Select a role to remove from **{email_val}**:",
+            view=RemoveRoleSelectView(email_val, tokens),
+            ephemeral=True,
+        )
+
+
+class RemoveRoleSelect(discord.ui.Select):
+    def __init__(self, email: str, tokens: List[str]) -> None:
+        self._email = email
+        super().__init__(
+            placeholder="Choose role to remove",
+            options=[discord.SelectOption(label=t, value=t) for t in tokens[:25]],
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        token = self.values[0]
+        await interaction.response.defer(ephemeral=True)
+
+        alloc = await db.fetch_allocation_by_email(self._email)
+        if not alloc:
+            await interaction.followup.send("Allocation no longer found.", ephemeral=True)
+            return
+        new_tokens = [t for t in split_projects_str(alloc.get("projects")) if t != token]
+        new_projects = ",".join(new_tokens)
+
+        assert db.pool is not None
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE allocations SET projects = $1, updated_at = NOW() WHERE email = $2",
+                _projects_to_db(new_tokens),
+                self._email,
+            )
+
+        guild = interaction.guild or bot.get_guild(SETTINGS.guild_id)
+        stripped_note = ""
+        if guild:
+            async with db.pool.acquire() as conn:
+                rec = await conn.fetchrow(
+                    "SELECT discord_user_id FROM discord_user_verification WHERE email = $1",
+                    self._email,
+                )
+            if rec:
+                uid = int(rec["discord_user_id"])
+                try:
+                    member = guild.get_member(uid) or await guild.fetch_member(uid)
+                    if member:
+                        removed = await remove_role_if_present(
+                            member, token, "Admin panel: remove role"
+                        )
+                        stripped_note = (
+                            f"\nRole `{token}` stripped from {member.mention}."
+                            if removed
+                            else f"\n{member.mention} didn't have `{token}` in Discord."
+                        )
+                except discord.NotFound:
+                    pass
+
+        if isinstance(interaction.user, discord.Member):
+            await db.log_admin_action(
+                interaction.user,
+                "remove_user_from_role",
+                target_email=self._email,
+                details={"removed_token": token, "remaining_projects": new_projects},
+            )
+
+        remaining = f"`{new_projects}`" if new_projects else "_(none)_"
+        await interaction.followup.send(
+            f"Removed `{token}` from **{self._email}**. Remaining: {remaining}.{stripped_note}",
+            ephemeral=True,
+        )
+
+
+class RemoveRoleSelectView(discord.ui.View):
+    def __init__(self, email: str, tokens: List[str]) -> None:
+        super().__init__(timeout=120)
+        self.add_item(RemoveRoleSelect(email, tokens))
+
+
+# ── View Members by Role ──────────────────────────────────────────────────────
+
+class ViewByRoleSelect(discord.ui.Select):
+    def __init__(self) -> None:
+        options = [
+            discord.SelectOption(label=r, value=r) for r in sorted(SETTINGS.managed_access_role_names)
+        ]
+        super().__init__(placeholder="Choose a role to view members", options=options[:25])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        role_name = self.values[0]
+        await interaction.response.defer(ephemeral=True)
+
+        assert db.pool is not None
+        async with db.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT duv.discord_user_id, duv.discord_username, duv.email, a.projects
+                FROM discord_user_verification duv
+                LEFT JOIN allocations a ON a.email = duv.email
+                WHERE duv.guild_id = $1 AND duv.status = 'VERIFIED'
+                ORDER BY duv.discord_username
+                """,
+                str(SETTINGS.guild_id),
+            )
+
+        matching = []
+        for row in rows:
+            tokens = split_projects_str(row["projects"])
+            resolved = {PROJECT_ROLE_ALIASES.get(t, t) for t in tokens} | set(tokens)
+            if role_name in resolved:
+                matching.append(row)
+
+        if not matching:
+            await interaction.followup.send(
+                f"No verified members found with role **{role_name}**.", ephemeral=True
+            )
+            return
+
+        lines = [
+            f"• <@{r['discord_user_id']}> `{r['discord_username'] or r['discord_user_id']}` — `{r['email'] or '—'}`"
+            for r in matching[:50]
+        ]
+        truncated = f"\n_…and {len(matching) - 50} more_" if len(matching) > 50 else ""
+        embed = discord.Embed(
+            title=f"Members with role: {role_name}",
+            description="\n".join(lines) + truncated,
+            colour=discord.Colour.green(),
+        )
+        embed.set_footer(text=f"Total: {len(matching)}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class ViewByRoleView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=120)
+        self.add_item(ViewByRoleSelect())
+
+
+# ── Edit Allocation ───────────────────────────────────────────────────────────
+
+class EditAllocationEmailModal(discord.ui.Modal, title="Edit Allocation"):
+    email = discord.ui.TextInput(
+        label="Email address to edit",
+        placeholder="user@example.com",
+        required=True,
+        max_length=200,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        email_val = self.email.value.strip().lower()
+        alloc = await db.fetch_allocation_by_email(email_val)
+        if not alloc:
+            await interaction.followup.send(f"No allocation found for `{email_val}`.", ephemeral=True)
+            return
+        current_projects = alloc.get("projects") or ""
+        current_active = "true" if alloc.get("active") else "false"
+        current_status = alloc.get("status") or "ACTIVE"
+        await interaction.followup.send(
+            f"**Editing `{email_val}`:**\n"
+            f"• Projects: `{current_projects}`\n"
+            f"• Active: `{current_active}`\n"
+            f"• Status: `{current_status}`\n\n"
+            "Click **Edit** to make changes:",
+            view=EditAllocationConfirmView(alloc),
+            ephemeral=True,
+        )
+
+
+class EditAllocationFieldsModal(discord.ui.Modal, title="Edit Allocation Fields"):
+    def __init__(self, alloc: Dict[str, Any]) -> None:
+        super().__init__()
+        self._email = str(alloc.get("email") or "").strip()
+        self.projects_input = discord.ui.TextInput(
+            label="Role tokens (comma-separated)",
+            default=",".join(split_projects_str(alloc.get("projects"))),
+            required=True,
+            max_length=500,
+        )
+        self.active_input = discord.ui.TextInput(
+            label="Active (true / false)",
+            default="true" if alloc.get("active") else "false",
+            required=True,
+            max_length=10,
+        )
+        self.status_input = discord.ui.TextInput(
+            label="Status (ACTIVE / REVOKE / BAN)",
+            default=str(alloc.get("status") or "ACTIVE"),
+            required=True,
+            max_length=20,
+        )
+        self.add_item(self.projects_input)
+        self.add_item(self.active_input)
+        self.add_item(self.status_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        projects_val = self.projects_input.value.strip()
+        active_val = self.active_input.value.strip().lower() in ("true", "1", "yes")
+        status_val = self.status_input.value.strip().upper()
+
+        if status_val not in ("ACTIVE", "REVOKE", "BAN"):
+            await interaction.followup.send(
+                "Status must be ACTIVE, REVOKE, or BAN.", ephemeral=True
+            )
+            return
+
+        # Parse user-typed comma-sep string into canonical tokens for DB write.
+        projects_tokens = split_projects_str(projects_val)
+        projects_display = ",".join(projects_tokens)
+
+        assert db.pool is not None
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE allocations SET projects=$1, active=$2, status=$3, updated_at=NOW() WHERE email=$4",
+                _projects_to_db(projects_tokens),
+                active_val,
+                status_val,
+                self._email,
+            )
+
+        if isinstance(interaction.user, discord.Member):
+            await db.log_admin_action(
+                interaction.user,
+                "edit_allocation",
+                target_email=self._email,
+                details={"projects": projects_display, "active": active_val, "status": status_val},
+            )
+
+        # Immediately strip roles when active is set to False
+        strip_note = ""
+        if not active_val:
+            guild = interaction.guild or bot.get_guild(SETTINGS.guild_id)
+            if guild:
+                assert db.pool is not None
+                async with db.pool.acquire() as conn:
+                    rec = await conn.fetchrow(
+                        "SELECT discord_user_id, discord_username FROM discord_user_verification "
+                        "WHERE email = $1 AND status = 'VERIFIED'",
+                        self._email,
+                    )
+                if rec:
+                    removed_by = str(interaction.user.id) if interaction.user else "system"
+                    try:
+                        uid = int(rec["discord_user_id"])
+                        member = guild.get_member(uid) or await guild.fetch_member(uid)
+                        if member:
+                            stripped = await _strip_inactive_allocation_member(
+                                member,
+                                email=self._email,
+                                reason="allocation.active set to False by admin",
+                                removed_by=removed_by,
+                            )
+                            strip_note = "\n• Managed roles **stripped** and logged to `user_removal`." if stripped else ""
+                    except discord.NotFound:
+                        await db.insert_user_removal(
+                            discord_user_id=int(rec["discord_user_id"]),
+                            email=self._email,
+                            discord_username=rec["discord_username"],
+                            reason="allocation.active set to False (member not in guild)",
+                            removed_by=removed_by,
+                        )
+                        await db.apply_revoke_completed(int(rec["discord_user_id"]))
+                        strip_note = "\n• Member not in guild — logged to `user_removal`."
+                    except Exception as exc:
+                        logger.warning("EditAllocation active=False strip failed for %s: %s", self._email, exc)
+
+        await interaction.followup.send(
+            f"Updated **{self._email}**:\n"
+            f"• Projects: `{projects_display}`\n"
+            f"• Active: `{active_val}`\n"
+            f"• Status: `{status_val}`"
+            + strip_note,
+            ephemeral=True,
+        )
+
+
+class EditAllocationConfirmView(discord.ui.View):
+    def __init__(self, alloc: Dict[str, Any]) -> None:
+        super().__init__(timeout=120)
+        self._alloc = alloc
+
+    @discord.ui.button(label="Edit", style=discord.ButtonStyle.primary)
+    async def edit_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_modal(EditAllocationFieldsModal(self._alloc))
+
+
+# ── Reset / Re-verify User ────────────────────────────────────────────────────
+
+class ResetUserModal(discord.ui.Modal, title="Reset / Re-verify User"):
+    user_input = discord.ui.TextInput(
+        label="Username, display name, or user ID",
+        placeholder="e.g. johndoe, John Doe, or 123456789012345678",
+        required=True,
+        max_length=200,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+
+        guild = interaction.guild or bot.get_guild(SETTINGS.guild_id)
+        if not guild:
+            await interaction.response.send_message("Guild not found.", ephemeral=True)
+            return
+
+        target = await _resolve_member_by_query(guild, self.user_input.value)
+
+        if target is None:
+            await interaction.response.send_message(
+                f"No member found matching **{discord.utils.escape_markdown(self.user_input.value.strip())}**. "
+                "Try their exact username or paste their user ID.",
+                ephemeral=True,
+            )
+            return
+
+        if target.bot:
+            await interaction.response.send_message("Cannot reset bots.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"Reset verification for {target.mention} (`{target}`)? "
+            "They will be re-gated and asked to verify again.",
+            view=ResetConfirmView(target),
+            ephemeral=True,
+        )
+
+
+class ResetConfirmView(discord.ui.View):
+    def __init__(self, member: discord.Member) -> None:
+        super().__init__(timeout=60)
+        self._member = member
+
+    @discord.ui.button(label="Confirm Reset", style=discord.ButtonStyle.danger)
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await db.reset_user(self._member.id)
+        await revoke_member_access(self._member, "Admin panel: reset verification")
+        await send_verification_required_notice(self._member, notice_trigger="admin_panel_reset")
+
+        if isinstance(interaction.user, discord.Member):
+            await db.log_admin_action(
+                interaction.user,
+                "reset_user",
+                target_discord_id=self._member.id,
+                details={"discord_username": str(self._member)},
+            )
+
+        await interaction.followup.send(
+            f"Verification reset for {self._member.mention}. They have been re-gated and notified.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_message("Reset cancelled.", ephemeral=True)
+
+
+# ── Bulk Add ──────────────────────────────────────────────────────────────────
+
+class BulkAddPasteModal(discord.ui.Modal, title="Bulk Add Users"):
+    content = discord.ui.TextInput(
+        label="email,projects — one entry per line",
+        placeholder="user@example.com,BB_Access\nother@example.com,maitrix-coders",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=4000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await _process_bulk_add_text(interaction, self.content.value, source="paste")
+
+
+class BulkAddChoiceView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Paste List", style=discord.ButtonStyle.primary)
+    async def paste(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_modal(BulkAddPasteModal())
+
+    @discord.ui.button(label="Upload CSV", style=discord.ButtonStyle.secondary)
+    async def upload_csv(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        channel = interaction.channel
+        if not channel:
+            await interaction.response.send_message("Cannot determine channel.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Upload a `.csv` file with columns `email,projects` to **this channel** within **60 seconds**.\n"
+            "A header row is optional. Example:\n```\nuser@example.com,BB_Access\nother@example.com,maitrix-coders\n```",
+            ephemeral=True,
+        )
+
+        def check(m: discord.Message) -> bool:
+            return (
+                m.author.id == interaction.user.id
+                and m.channel.id == channel.id  # type: ignore[union-attr]
+                and bool(m.attachments)
+            )
+
+        try:
+            msg = await bot.wait_for("message", check=check, timeout=60)
+        except asyncio.TimeoutError:
+            await interaction.followup.send("Timed out. No file received.", ephemeral=True)
+            return
+
+        attachment = msg.attachments[0]
+        if not attachment.filename.lower().endswith(".csv"):
+            await interaction.followup.send("Please upload a `.csv` file.", ephemeral=True)
+            return
+
+        raw = await attachment.read()
+        text = raw.decode("utf-8", errors="replace")
+        await _process_bulk_add_text(interaction, text, source="csv")
+
+
+async def _process_bulk_add_text(
+    interaction: discord.Interaction, text: str, source: str
+) -> None:
+    import csv as csv_mod
+    import io as io_mod
+
+    guild = interaction.guild or bot.get_guild(SETTINGS.guild_id)
+    reader = csv_mod.reader(io_mod.StringIO(text.strip()))
+    added = updated = 0
+    failed: List[str] = []
+
+    assert db.pool is not None
+    for row in reader:
+        if not row:
+            continue
+        if row[0].strip().lower() in ("email", "e-mail"):
+            continue
+        if len(row) < 2:
+            failed.append(f"`{row[0].strip()}` — missing projects column")
+            continue
+        email_val = row[0].strip().lower()
+        projects_val = row[1].strip()
+        if not email_val or "@" not in email_val:
+            failed.append(f"`{row[0].strip()}` — invalid email")
+            continue
+        tokens = [t.strip() for t in re.split(r"[,;|/]+", projects_val) if t.strip()]
+        bad = [t for t in tokens if t not in SETTINGS.managed_access_role_names]
+        if bad:
+            failed.append(f"`{email_val}` — invalid tokens: {', '.join(bad)}")
+            continue
+        try:
+            async with db.pool.acquire() as conn:
+                existing = await conn.fetchrow(
+                    "SELECT email FROM allocations WHERE email = $1", email_val
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO allocations (email, projects, active, status, updated_at)
+                    VALUES ($1, $2, TRUE, 'ACTIVE', NOW())
+                    ON CONFLICT (email) DO UPDATE SET
+                        projects = EXCLUDED.projects,
+                        active = TRUE,
+                        status = 'ACTIVE',
+                        updated_at = NOW()
+                    """,
+                    email_val,
+                    _projects_to_db(tokens),
+                )
+            if existing:
+                updated += 1
+            else:
+                added += 1
+            if guild:
+                async with db.pool.acquire() as conn:
+                    rec = await conn.fetchrow(
+                        "SELECT discord_user_id FROM discord_user_verification WHERE email = $1 AND status = 'VERIFIED'",
+                        email_val,
+                    )
+                if rec:
+                    uid = int(rec["discord_user_id"])
+                    try:
+                        member = guild.get_member(uid) or await guild.fetch_member(uid)
+                        if member:
+                            alloc = await db.fetch_allocation_by_email(email_val)
+                            if alloc:
+                                t_list = get_managed_role_tokens_for_verified_allocation(alloc)
+                                allowed_r = allowed_managed_access_names_from_tokens(guild, t_list)
+                                await sync_managed_access_roles(
+                                    member, allowed_r, "Admin panel: bulk add"
+                                )
+                    except discord.NotFound:
+                        pass
+        except Exception as exc:
+            logger.exception("Bulk add error for %s", email_val)
+            failed.append(f"`{email_val}` — error: {exc}")
+
+    if isinstance(interaction.user, discord.Member):
+        await db.log_admin_action(
+            interaction.user,
+            "bulk_add",
+            details={"source": source, "added": added, "updated": updated, "failed_count": len(failed)},
+        )
+
+    summary = (
+        f"**Bulk add complete** (via {source})\n"
+        f"✅ New: {added} | 🔄 Updated: {updated} | ❌ Failed: {len(failed)}"
+    )
+    if failed:
+        fail_lines = "\n".join(failed[:20])
+        if len(failed) > 20:
+            fail_lines += f"\n…and {len(failed) - 20} more"
+        summary += f"\n\n**Failures:**\n{fail_lines}"
+    await interaction.followup.send(summary, ephemeral=True)
+
+
+# ── Bulk Assign Role ──────────────────────────────────────────────────────────
+
+class BulkAssignRoleModal(discord.ui.Modal, title="Bulk Assign Role"):
+    users_input = discord.ui.TextInput(
+        label="Discord usernames or IDs (one per line)",
+        style=discord.TextStyle.paragraph,
+        placeholder="johndoe\n123456789012345678\nJane Doe",
+        required=True,
+        max_length=4000,
+    )
+    role_token = discord.ui.TextInput(
+        label="Role token to assign",
+        placeholder="BB_Access",
+        required=True,
+        max_length=100,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        token = self.role_token.value.strip()
+        if token not in SETTINGS.managed_access_role_names:
+            valid = ", ".join(sorted(SETTINGS.managed_access_role_names))
+            await interaction.followup.send(
+                f"Invalid role token `{token}`.\nValid options: `{valid}`", ephemeral=True
+            )
+            return
+
+        guild = interaction.guild or bot.get_guild(SETTINGS.guild_id)
+        if not guild:
+            await interaction.followup.send("Guild not found.", ephemeral=True)
+            return
+
+        lines = [l.strip() for l in self.users_input.value.splitlines() if l.strip()]
+        ok: List[str] = []
+        no_alloc: List[str] = []
+        not_found: List[str] = []
+
+        for line in lines:
+            member = await _resolve_member_by_query(guild, line)
+            if member is None:
+                not_found.append(line)
+                continue
+            rec = await db.get_user(member.id)
+            email = (rec.get("email") or "").strip() if rec else ""
+            if not email:
+                no_alloc.append(str(member))
+                continue
+            try:
+                assert db.pool is not None
+                async with db.pool.acquire() as conn:
+                    alloc = await conn.fetchrow("SELECT projects FROM allocations WHERE email = $1", email)
+                    if alloc is None:
+                        no_alloc.append(str(member))
+                        continue
+                    existing_tokens = split_projects_str(alloc["projects"])
+                    if token not in existing_tokens:
+                        existing_tokens.append(token)
+                    await conn.execute(
+                        "UPDATE allocations SET projects=$1, updated_at=NOW() WHERE email=$2",
+                        _projects_to_db(existing_tokens),
+                        email,
+                    )
+                allowed = allowed_managed_access_names_from_tokens(guild, existing_tokens)
+                await sync_managed_access_roles(member, allowed, "Admin panel: bulk assign role")
+                if isinstance(interaction.user, discord.Member):
+                    await db.log_admin_action(
+                        interaction.user,
+                        "bulk_role_allocation",
+                        target_discord_id=member.id,
+                        target_email=email,
+                        details={"role_token": token},
+                    )
+                ok.append(str(member))
+            except Exception as exc:
+                logger.exception("BulkAssignRole error for %s", member.id)
+                no_alloc.append(f"{member} (error: {exc})")
+
+        lines_out = [f"✅ Assigned `{token}` to {len(ok)} members."]
+        if not_found:
+            lines_out.append(f"❌ Not found ({len(not_found)}): " + ", ".join(not_found[:10]))
+        if no_alloc:
+            lines_out.append(f"⚠️ No allocation ({len(no_alloc)}): " + ", ".join(no_alloc[:10]))
+        await interaction.followup.send("\n".join(lines_out), ephemeral=True)
+
+
+# ── Bulk Remove Role ──────────────────────────────────────────────────────────
+
+class BulkRemoveRoleModal(discord.ui.Modal, title="Bulk Remove Role"):
+    users_input = discord.ui.TextInput(
+        label="Discord usernames or IDs (one per line)",
+        style=discord.TextStyle.paragraph,
+        placeholder="johndoe\n123456789012345678\nJane Doe",
+        required=True,
+        max_length=4000,
+    )
+    role_token = discord.ui.TextInput(
+        label="Role token to remove",
+        placeholder="BB_Access",
+        required=True,
+        max_length=100,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        token = self.role_token.value.strip()
+        guild = interaction.guild or bot.get_guild(SETTINGS.guild_id)
+        if not guild:
+            await interaction.followup.send("Guild not found.", ephemeral=True)
+            return
+
+        lines = [l.strip() for l in self.users_input.value.splitlines() if l.strip()]
+        ok: List[str] = []
+        no_alloc: List[str] = []
+        not_found: List[str] = []
+
+        for line in lines:
+            member = await _resolve_member_by_query(guild, line)
+            if member is None:
+                not_found.append(line)
+                continue
+            rec = await db.get_user(member.id)
+            email = (rec.get("email") or "").strip() if rec else ""
+            if not email:
+                no_alloc.append(str(member))
+                continue
+            try:
+                assert db.pool is not None
+                async with db.pool.acquire() as conn:
+                    alloc = await conn.fetchrow("SELECT projects FROM allocations WHERE email = $1", email)
+                    if alloc is None:
+                        no_alloc.append(str(member))
+                        continue
+                    new_tokens = [t for t in split_projects_str(alloc["projects"]) if t != token]
+                    await conn.execute(
+                        "UPDATE allocations SET projects=$1, updated_at=NOW() WHERE email=$2",
+                        _projects_to_db(new_tokens),
+                        email,
+                    )
+                allowed = allowed_managed_access_names_from_tokens(guild, new_tokens)
+                await sync_managed_access_roles(member, allowed, "Admin panel: bulk remove role")
+                if isinstance(interaction.user, discord.Member):
+                    await db.log_admin_action(
+                        interaction.user,
+                        "bulk_role_removal",
+                        target_discord_id=member.id,
+                        target_email=email,
+                        details={"role_token": token, "remaining": new_tokens},
+                    )
+                ok.append(str(member))
+            except Exception as exc:
+                logger.exception("BulkRemoveRole error for %s", member.id)
+                no_alloc.append(f"{member} (error: {exc})")
+
+        lines_out = [f"✅ Removed `{token}` from {len(ok)} members."]
+        if not_found:
+            lines_out.append(f"❌ Not found ({len(not_found)}): " + ", ".join(not_found[:10]))
+        if no_alloc:
+            lines_out.append(f"⚠️ No allocation ({len(no_alloc)}): " + ", ".join(no_alloc[:10]))
+        await interaction.followup.send("\n".join(lines_out), ephemeral=True)
+
+
+# ── Bulk Server Remove ────────────────────────────────────────────────────────
+
+class BulkServerRemoveModal(discord.ui.Modal, title="Bulk Server Remove (Kick)"):
+    users_input = discord.ui.TextInput(
+        label="Discord usernames or IDs (one per line)",
+        style=discord.TextStyle.paragraph,
+        placeholder="johndoe\n123456789012345678\nJane Doe",
+        required=True,
+        max_length=4000,
+    )
+    reason = discord.ui.TextInput(
+        label="Reason (optional)",
+        required=False,
+        max_length=500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild or bot.get_guild(SETTINGS.guild_id)
+        if not guild:
+            await interaction.followup.send("Guild not found.", ephemeral=True)
+            return
+
+        kick_reason = (self.reason.value or "").strip() or "Bulk removal by admin"
+        lines = [l.strip() for l in self.users_input.value.splitlines() if l.strip()]
+        kicked: List[str] = []
+        skipped: List[str] = []
+        not_found: List[str] = []
+        me = guild.me
+
+        for line in lines:
+            member = await _resolve_member_by_query(guild, line)
+            if member is None:
+                not_found.append(line)
+                continue
+            if member.bot or member.id == guild.owner_id:
+                skipped.append(f"{member} (bot/owner)")
+                continue
+            if me and member.top_role >= me.top_role:
+                skipped.append(f"{member} (higher role)")
+                continue
+            rec = await db.get_user(member.id)
+            alloc_email = (rec.get("email") or "").strip() if rec else ""
+            try:
+                await member.kick(reason=kick_reason[:500])
+                if alloc_email:
+                    await db.set_allocation_status_by_email(alloc_email, "REVOKE")
+                if isinstance(interaction.user, discord.Member):
+                    await db.log_admin_action(
+                        interaction.user,
+                        "bulk_server_removal",
+                        target_discord_id=member.id,
+                        target_email=alloc_email or None,
+                        details={"reason": kick_reason},
+                    )
+                kicked.append(str(member))
+            except discord.Forbidden:
+                skipped.append(f"{member} (forbidden)")
+            except discord.HTTPException as exc:
+                skipped.append(f"{member} (error: {exc})")
+
+        lines_out = [f"✅ Kicked {len(kicked)} members."]
+        if not_found:
+            lines_out.append(f"❌ Not found ({len(not_found)}): " + ", ".join(not_found[:10]))
+        if skipped:
+            lines_out.append(f"⚠️ Skipped ({len(skipped)}): " + ", ".join(skipped[:10]))
+        await interaction.followup.send("\n".join(lines_out), ephemeral=True)
+
+
+# ── Role Config ───────────────────────────────────────────────────────────────
+
+class ManageManagedRolesModal(discord.ui.Modal, title="Manage Managed Access Roles"):
+    action = discord.ui.TextInput(
+        label="Action: add / remove / set",
+        placeholder="add",
+        required=True,
+        max_length=10,
+    )
+    roles_input = discord.ui.TextInput(
+        label="Role names (comma-separated)",
+        placeholder="BB_Access,maitrix-coders",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=2000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        act = self.action.value.strip().lower()
+        names = [r.strip() for r in re.split(r"[,;|]+", self.roles_input.value) if r.strip()]
+
+        if act == "set":
+            SETTINGS.managed_access_role_names.clear()
+            SETTINGS.managed_access_role_names.update(names)
+        elif act == "add":
+            SETTINGS.managed_access_role_names.update(names)
+        elif act == "remove":
+            for n in names:
+                SETTINGS.managed_access_role_names.discard(n)
+        else:
+            await interaction.followup.send("Action must be `add`, `remove`, or `set`.", ephemeral=True)
+            return
+
+        await db.save_role_config(managed=list(SETTINGS.managed_access_role_names))
+        if isinstance(interaction.user, discord.Member):
+            await db.log_admin_action(
+                interaction.user,
+                "update_managed_roles_config",
+                details={"action": act, "names": names, "current": sorted(SETTINGS.managed_access_role_names)},
+            )
+        current = ", ".join(sorted(SETTINGS.managed_access_role_names)) or "none"
+        await interaction.followup.send(
+            f"Managed roles updated (`{act}`).\n**Current:** `{current}`", ephemeral=True
+        )
+
+
+class ManageExemptRolesModal(discord.ui.Modal, title="Manage Exempt Roles"):
+    action = discord.ui.TextInput(
+        label="Action: add / remove / set",
+        placeholder="add",
+        required=True,
+        max_length=10,
+    )
+    roles_input = discord.ui.TextInput(
+        label="Role names (comma-separated)",
+        placeholder="Admin,Support",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=2000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        act = self.action.value.strip().lower()
+        names = [r.strip() for r in re.split(r"[,;|]+", self.roles_input.value) if r.strip()]
+
+        if act == "set":
+            SETTINGS.verification_exempt_role_names.clear()
+            SETTINGS.verification_exempt_role_names.update(names)
+        elif act == "add":
+            SETTINGS.verification_exempt_role_names.update(names)
+        elif act == "remove":
+            for n in names:
+                SETTINGS.verification_exempt_role_names.discard(n)
+        else:
+            await interaction.followup.send("Action must be `add`, `remove`, or `set`.", ephemeral=True)
+            return
+
+        await db.save_role_config(exempt=list(SETTINGS.verification_exempt_role_names))
+        if isinstance(interaction.user, discord.Member):
+            await db.log_admin_action(
+                interaction.user,
+                "update_exempt_roles_config",
+                details={"action": act, "names": names, "current": sorted(SETTINGS.verification_exempt_role_names)},
+            )
+        current = ", ".join(sorted(SETTINGS.verification_exempt_role_names)) or "none"
+        await interaction.followup.send(
+            f"Exempt roles updated (`{act}`).\n**Current:** `{current}`", ephemeral=True
+        )
+
+
+class ViewRolesConfigView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="Edit Managed Roles", style=discord.ButtonStyle.primary)
+    async def edit_managed(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ManageManagedRolesModal())
+
+    @discord.ui.button(label="Edit Exempt Roles", style=discord.ButtonStyle.secondary)
+    async def edit_exempt(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ManageExemptRolesModal())
+
+
+# ── Main AdminPanelView ───────────────────────────────────────────────────────
+
+class AdminPanelView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Add User to Role",
+        style=discord.ButtonStyle.success,
+        custom_id="admin_add_user",
+        row=0,
+    )
+    async def add_user(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_modal(AddUserModal())
+
+    @discord.ui.button(
+        label="Remove User from Role",
+        style=discord.ButtonStyle.danger,
+        custom_id="admin_remove_role",
+        row=0,
+    )
+    async def remove_role(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RemoveRoleEmailModal())
+
+    @discord.ui.button(
+        label="View Members by Role",
+        style=discord.ButtonStyle.secondary,
+        custom_id="admin_view_role",
+        row=1,
+    )
+    async def view_role(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Select a role:", view=ViewByRoleView(), ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Edit Allocation",
+        style=discord.ButtonStyle.primary,
+        custom_id="admin_edit_alloc",
+        row=1,
+    )
+    async def edit_alloc(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_modal(EditAllocationEmailModal())
+
+    @discord.ui.button(
+        label="Reset / Re-verify User",
+        style=discord.ButtonStyle.danger,
+        custom_id="admin_reset_user",
+        row=2,
+    )
+    async def reset_user_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ResetUserModal())
+
+    @discord.ui.button(
+        label="Bulk Add Users",
+        style=discord.ButtonStyle.secondary,
+        custom_id="admin_bulk_add",
+        row=2,
+    )
+    async def bulk_add(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "How would you like to add users?", view=BulkAddChoiceView(), ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Bulk Assign Role",
+        style=discord.ButtonStyle.success,
+        custom_id="admin_bulk_assign_role",
+        row=3,
+    )
+    async def bulk_assign_role(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_modal(BulkAssignRoleModal())
+
+    @discord.ui.button(
+        label="Bulk Remove Role",
+        style=discord.ButtonStyle.danger,
+        custom_id="admin_bulk_remove_role",
+        row=3,
+    )
+    async def bulk_remove_role(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_modal(BulkRemoveRoleModal())
+
+    @discord.ui.button(
+        label="Bulk Server Remove",
+        style=discord.ButtonStyle.danger,
+        custom_id="admin_bulk_server_remove",
+        row=3,
+    )
+    async def bulk_server_remove(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        await interaction.response.send_modal(BulkServerRemoveModal())
+
+    @discord.ui.button(
+        label="Role Config",
+        style=discord.ButtonStyle.secondary,
+        custom_id="admin_role_config",
+        row=4,
+    )
+    async def role_config(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _is_panel_authorized(interaction):
+            await interaction.response.send_message("Access denied.", ephemeral=True)
+            return
+        managed = ", ".join(sorted(SETTINGS.managed_access_role_names)) or "none"
+        exempt = ", ".join(sorted(SETTINGS.verification_exempt_role_names)) or "none"
+        await interaction.response.send_message(
+            f"**Managed Roles** (require verification):\n`{managed}`\n\n"
+            f"**Exempt Roles** (skip verification):\n`{exempt}`",
+            view=ViewRolesConfigView(),
+            ephemeral=True,
+        )
+
+
+# ── AdminPanel Cog ────────────────────────────────────────────────────────────
+
+class AdminPanel(commands.Cog):
+    def __init__(self, bot_instance: commands.Bot) -> None:
+        self._bot = bot_instance
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        await self._setup_panel()
+
+    async def _setup_panel(self) -> None:
+        guild = self._bot.get_guild(SETTINGS.guild_id)
+        if not guild:
+            logger.warning("AdminPanel: guild %s not found", SETTINGS.guild_id)
+            return
+        channel = discord.utils.get(guild.text_channels, name=ADMIN_PANEL_CHANNEL_NAME)
+        if not channel:
+            logger.warning(
+                "AdminPanel: channel #%s not found — create it and restrict access to %s/%s",
+                ADMIN_PANEL_CHANNEL_NAME,
+                SETTINGS.admin_role_name,
+                SUPPORT_ROLE_NAME,
+            )
+            return
+        embed = _panel_embed()
+        saved_id = await _load_admin_panel_id()
+        if saved_id:
+            try:
+                msg = await channel.fetch_message(saved_id)
+                await msg.edit(embed=embed, view=AdminPanelView())
+                logger.info(
+                    "AdminPanel: restored panel (message %s) in #%s",
+                    saved_id,
+                    ADMIN_PANEL_CHANNEL_NAME,
+                )
+                return
+            except (discord.NotFound, discord.HTTPException):
+                logger.info("AdminPanel: saved message not found, re-creating panel")
+        msg = await channel.send(embed=embed, view=AdminPanelView())
+        await _save_admin_panel_id(msg.id)
+        logger.info(
+            "AdminPanel: created new panel (message %s) in #%s",
+            msg.id,
+            ADMIN_PANEL_CHANNEL_NAME,
+        )
 
 
 # ============================================================
@@ -2055,6 +3675,7 @@ async def ban_command(ctx: commands.Context, member: Optional[discord.Member] = 
 # ============================================================
 async def main() -> None:
     async with bot:
+        await bot.add_cog(AdminPanel(bot))
         await start_health_server()
         await bot.start(SETTINGS.discord_token)
 
